@@ -1,0 +1,27 @@
+{
+    "configurations": [
+        {
+            "name": "Linux Kernel",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "/lib/modules/7.0.0-28-generic/build/include",
+                "/lib/modules/7.0.0-28-generic/build/arch/x86/include",
+                "/lib/modules/7.0.0-28-generic/build/include/generated",
+                "/lib/modules/7.0.0-28-generic/build/arch/x86/include/generated",
+                "/lib/modules/7.0.0-28-generic/build/include/uapi",
+                "/lib/modules/7.0.0-28-generic/build/arch/x86/include/uapi",
+                "/lib/modules/7.0.0-28-generic/build/include/generated/uapi",
+                "/lib/modules/7.0.0-28-generic/build/arch/x86/include/generated/uapi"
+            ],
+            "defines": [
+                "__KERNEL__",
+                "MODULE"
+            ],
+            "compilerPath": "/usr/bin/gcc",
+            "cStandard": "gnu11",
+            "cppStandard": "gnu++17",
+            "intelliSenseMode": "linux-gcc-x64"
+        }
+    ],
+    "version": 4
+}
