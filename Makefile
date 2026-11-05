@@ -1,23 +1,40 @@
-# Define el nombre de tu módulo
-MODULE_NAME = mydriver
-obj-m += $(MODULE_NAME).o
+# Nombre del módulo
+MODULE_NAME := mydriver
+obj-m       := $(MODULE_NAME).o
 
-# Variables de entorno para la ruta
-KDIR ?= /lib/modules/$(shell uname -r)/build
-PWD := $(shell pwd)
-OBJ_DIR := $(PWD)/obj
+# Rutas del entorno
+KDIR        ?= /home/guido/bbb-kernel-headers
+SRC_DIR     := $(shell pwd)
+OUTPUT_DIR  := $(SRC_DIR)/obj
 
-all:
-	# 1. Crea la carpeta obj si no existe
-	mkdir -p $(OBJ_DIR)
-	# 2. Copia el código fuente y este mismo Makefile a la carpeta obj
-	cp *.c $(OBJ_DIR)/
-	cp Makefile $(OBJ_DIR)/
-	# 3. Ejecuta la compilación apuntando M= al directorio obj
-	make -C $(KDIR) M=$(OBJ_DIR) modules
+# Toolchain de compilación cruzada
+ARCH          ?= arm
+CROSS_COMPILE ?= arm-linux-gnueabihf-
+
+# Datos de la BeagleBone Black
+BBB_IP   ?= 192.168.7.2
+BBB_USER ?= debian
+BBB_DIR  ?= /home/debian
+
+all: prepare
+	$(MAKE) -C $(KDIR) M=$(OUTPUT_DIR) src=$(SRC_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) modules
+
+prepare:
+	@mkdir -p $(OUTPUT_DIR)
+	@# Kbuild necesita encontrar o enlazar el fuente y el Makefile de construcción dentro del directorio destino
+	@ln -sf $(SRC_DIR)/$(MODULE_NAME).c $(OUTPUT_DIR)/$(MODULE_NAME).c
+	@echo "obj-m := $(MODULE_NAME).o" > $(OUTPUT_DIR)/Kbuild
 
 clean:
-	# Limpia los archivos generados por Kbuild en obj/
-	make -C $(KDIR) M=$(OBJ_DIR) clean
-	# Elimina la carpeta obj por completo
-	rm -rf $(OBJ_DIR)
+	@if [ -d "$(OUTPUT_DIR)" ]; then \
+		$(MAKE) -C $(KDIR) M=$(OUTPUT_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) clean; \
+		rm -rf $(OUTPUT_DIR); \
+	fi
+	@rm -f $(SRC_DIR)/*.o $(SRC_DIR)/*.ko $(SRC_DIR)/*.mod* $(SRC_DIR)/*.symvers $(SRC_DIR)/*.order $(SRC_DIR)/.*.cmd
+
+deploy: all
+	@echo "Enviando $(OUTPUT_DIR)/$(MODULE_NAME).ko a $(BBB_USER)@$(BBB_IP):$(BBB_DIR)..."
+	scp $(OUTPUT_DIR)/$(MODULE_NAME).ko $(BBB_USER)@$(BBB_IP):$(BBB_DIR)/
+	@echo "Despliegue finalizado con éxito."
+
+.PHONY: all prepare clean deploy
