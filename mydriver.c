@@ -1,17 +1,4 @@
-#include <linux/init.h>
-#include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/cdev.h>
-#include <linux/fs.h>
-#include <linux/of.h>
-#include <linux/platform_device.h>
-#include <linux/uaccess.h> // Para copy_to_user
-#include <linux/slab.h>    // Para kzalloc y kfree
-#include <linux/device.h>  // Para class_create, device_create
-
-#define CDEV_NBR 1
-#define CDEV_MINORBASE 0
-#define BUFF_SIZE 1024      // Faltaba definir el tamaño del buffer
+#include "mydriver.h"
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Guido");
@@ -20,25 +7,6 @@ MODULE_DESCRIPTION("Un driver de ejemplo");
 static const char __MODULE_NAME__[] = "cin"; // No poner nombres raros por que no carga el driver sino. (todo junto sin caracter especiales)
 
 static struct class *cinp_class; // Necesario para crear el nodo en /dev
-
-// Estructura que contiene los datos del device.
-typedef struct {
-    dev_t cinp_dev;
-    struct cdev cinp_cdev;
-} chardev_t;
-
-// Estructura unificada para manejar la data privada del dispositivo
-typedef struct {
-    struct device *cinp_device;
-    struct platform_device *pdev;
-    chardev_t cinp_cstm_cdev;
-
-
-    char buffer[BUFF_SIZE];
-    size_t buffer_len;
-
-
-} cinp_handler_t;
 
 
 // Funciones para manejar los atributos de sysfs
@@ -372,8 +340,9 @@ static void cinp_remove(struct platform_device *pdev)
     pr_info("%s Device removed\n", __MODULE_NAME__);
 }
 
+// nombre que aparece en DT.
 static const struct of_device_id cinp_of_match[] = {
-    { .compatible = "fabricante,modulo", },
+    { .compatible = "utn,cin-device", },
     { },
 };
 // Se declara la tabla para que udev pueda cargar el driver automáticamente
@@ -390,7 +359,6 @@ static struct platform_driver cinp_driver = {
     },
 };
 
-static struct platform_device *cinp_pdev;
 
 static int __init cinp_init(void)
 {
@@ -404,10 +372,7 @@ static int __init cinp_init(void)
     if (IS_ERR(cinp_class)) {
         status = PTR_ERR(cinp_class);
         cinp_class = NULL;
-
-        pr_err("%s Failed to create class: %d\n",
-               __MODULE_NAME__, status);
-
+        pr_err("%s Failed to create class: %d\n", __MODULE_NAME__, status);
         return status;
     }
 
@@ -418,39 +383,9 @@ static int __init cinp_init(void)
     status = platform_driver_register(&cinp_driver);
 
     if (status < 0) {
-        pr_err("%s Failed to register platform driver: %d\n",
-               __MODULE_NAME__, status);
-
+        pr_err("%s Failed to register platform driver: %d\n",__MODULE_NAME__, status);
         class_destroy(cinp_class);
         cinp_class = NULL;
-
-        return status;
-    }
-
-    /*
-     * Dispositivo de respaldo para pruebas sin Device Tree.
-     * En producción, normalmente se elimina si el dispositivo
-     * ya está declarado en Device Tree.
-     */
-    cinp_pdev = platform_device_register_simple(
-        "cin_platform_driver",
-        -1,
-        NULL,
-        0
-    );
-
-    if (IS_ERR(cinp_pdev)) {
-        status = PTR_ERR(cinp_pdev);
-        cinp_pdev = NULL;
-
-        pr_err("%s Failed to register fallback platform device: %d\n",
-               __MODULE_NAME__, status);
-
-        platform_driver_unregister(&cinp_driver);
-
-        class_destroy(cinp_class);
-        cinp_class = NULL;
-
         return status;
     }
 
@@ -458,12 +393,6 @@ static int __init cinp_init(void)
 }
 static void __exit cinp_exit(void)
 {
-    // Desregistrar el dispositivo de respaldo, si existe.
-    if (cinp_pdev) {
-        platform_device_unregister(cinp_pdev);
-        cinp_pdev = NULL;
-    }
-
     // Desregistrar el driver.
     // Esto provoca remove() para las instancias que sigan asociadas.
     platform_driver_unregister(&cinp_driver);

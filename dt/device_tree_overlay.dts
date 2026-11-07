@@ -1,0 +1,8 @@
+/dts-v1/;
+/plugin/;
+
+&mcasp0 {
+    compatible = "utn,cin-device"; // "{fabricante},{device}"
+    status = "okay";
+    utn,frecuencia = <1000>; // Hz
+};
