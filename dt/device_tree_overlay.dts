@@ -1,8 +1,27 @@
 /dts-v1/;
 /plugin/;
 
+/* Configuración del Multiplexor de Pines (Pinmux) */
+&am33xx_pinmux {
+    mcasp0_pins: mcasp0_pins {
+        pinctrl-single,pins = <
+            /* P9_31: mcasp0_aclkx (Offset 0x190 | Conf 0x28: RX Active, Pull Disabled | Mode 0) */
+            0x190 0x28 0x00
+            /* P9_29: mcasp0_fsx   (Offset 0x194 | Conf 0x28: RX Active, Pull Disabled | Mode 0) */
+            0x194 0x28 0x00
+            /* P9_30: mcasp0_axr0  (Offset 0x198 | Conf 0x08: Output, Pull Disabled    | Mode 0) */
+            0x198 0x08 0x00
+        >;
+    };
+};
+
 &mcasp0 {
-    compatible = "utn,cin-device"; // "{fabricante},{device}"
+    compatible = "utn,cin-device";
     status = "okay";
-    utn,frecuencia = <1000>; // Hz
+
+    /* Le indico al McASP que use los pines de arriba */
+    pinctrl-names = "default";
+    pinctrl-0 = <&mcasp0_pins>;
+
+    utn,frecuencia = <1000000>;
 };
