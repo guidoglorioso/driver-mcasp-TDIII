@@ -14,6 +14,7 @@
 #include <linux/clk.h>
 #include <linux/delay.h>
 #include <linux/io.h>
+#include <linux/mutex.h>
 
 #define CDEV_NBR 1
 #define CDEV_MINORBASE 0
@@ -23,14 +24,35 @@
 #define MCASP_PDIR_REG 0x14     /* Pin Direction Register (0: Input, 1: Output) */ 
 #define MCASP_GBLCTL_REG 0x44   /* Global Control Register */ 
 #define MCASP_RGBLCTL_REG 0x60  /* Receive Global Control Register */
+#define MCASP_RMASK_REG   0x64  /* Receive Format Unit Bit Mask Register */
+#define MCASP_RFMT_REG    0x68  /* Receive Bit Stream Format Register */
+#define MCASP_AFSRCTL_REG 0x6C  /* Receive Frame Sync Control Register */
+#define MCASP_ACLKRCTL_REG 0x70 /* Receive Clock Control Register */
+#define MCASP_RTDM_REG    0x78  /* Receive TDM Time Slot Register */
+#define MCASP_RINTCTL_REG 0x7C  /* Receive Interrupt Control Register */
+#define MCASP_RSTAT_REG   0x80  /* Receive Status Register */
+
 #define MCASP_XGBLCTL_REG 0xA0  /* Transmit Global Control Register */ 
+#define MCASP_XMASK_REG   0xA4  /* Transmit Format Unit Bit Mask Register */
+#define MCASP_XFMT_REG    0xA8  /* Transmit Bit Stream Format Register */
+#define MCASP_AFSXCTL_REG 0xAC  /* Transmit Frame Sync Control Register  */
 #define MCASP_ACLKXCTL_REG 0xB0 /* Transmit Bit.Clock Control */ 
 #define MCASP_AHCLKXCTL_REG 0xB4 /* Transmit High-Frequency Clock Control */
-#define MCASP_ACLKRCTL_REG 0x70 /* Receive Clock Control Register */
+#define MCASP_XTDM_REG    0xB8  /* Transmit TDM Time Slot Register */
+#define MCASP_XINTCTL_REG 0xBC  /* Transmit Interrupt Control Register */
+#define MCASP_XSTAT_REG   0xC0  /* Transmit Status Register */
+#define MCASP_SRCTL0_REG  0x180 /* Serializer 0 Control Register (AXR0) */
+#define MCASP_SRCTL1_REG  0x184 /* Serializer 1 Control Register (AXR1) */
+#define MCASP_XBUF0_REG   0x200 /* Transmit Buffer Register for Serializer 0 (AXR0) */
+#define MCASP_RBUF1_REG   0x284 /* Receive Buffer Register for Serializer 1 (AXR1) */
 
-#define MCASP_AFSXCTL_REG  0xAC /* Transmit Frame Sync Control Register  */
+#define MCASP_WRITE_TX_BUF(handler, word) iowrite32((uint32_t)(word), (handler)->instance + MCASP_XBUF0_REG)
+#define MCASP_READ_RX_BUF(handler)        ioread32((handler)->instance + MCASP_RBUF1_REG)
 
 #define XTAL_FREQ 24000000
+
+#define SLAVE  0
+#define MASTER 1
 
 
 // Estructura que contiene los datos del device.
@@ -53,6 +75,11 @@ typedef struct {
     // Memoria de I2s y Clk
     void __iomem *instance;
     struct clk *fck;
+    bool clk_enabled;
+
+    // Exclusión mutua para open/close
+    struct mutex lock;
+
     // Parametros de I2S
     uint32_t hertz;
     uint32_t square_on;

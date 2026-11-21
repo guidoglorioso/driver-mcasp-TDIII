@@ -11,6 +11,8 @@
             0x194 0x28 0x00
             /* P9_30: mcasp0_axr0  (Offset 0x198 | Conf 0x08: Output, Pull Disabled    | Mode 0) */
             0x198 0x08 0x00
+            /* P9_41: mcasp0_axr1  (Offset 0x1a8 | Conf 0x28: RX Active, Pull Disabled | Mode 0) */
+            0x1a8 0x28 0x00
         >;
     };
 };
