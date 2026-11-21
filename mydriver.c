@@ -121,6 +121,33 @@ static irqreturn_t isr_tx_mcasp(int irq, void *dev_id) {
     return IRQ_HANDLED;
 }
 
+static irqreturn_t isr_rx_mcasp(int irq, void *dev_id) {
+    cinp_handler_t *handler = (cinp_handler_t *)dev_id;
+    uint32_t rstat;
+    uint32_t word;
+
+    if (!handler || !handler->instance || !handler->clk_enabled)
+        return IRQ_NONE;
+
+    rstat = ioread32(handler->instance + MCASP_RSTAT_REG);
+
+    if (rstat & MCASP_INT_DATA) {
+        word = MCASP_READ_RX_BUF(handler);
+
+        cb_push(&handler->rx_buf, (uint8_t)((word >> 24) & 0xFF));
+        cb_push(&handler->rx_buf, (uint8_t)((word >> 16) & 0xFF));
+        cb_push(&handler->rx_buf, (uint8_t)((word >> 8)  & 0xFF));
+        cb_push(&handler->rx_buf, (uint8_t)((word >> 0)  & 0xFF));
+    }
+
+    // Limpiar flags de error/estado adicionales en RSTAT si los hubiera
+    if (rstat & ~MCASP_INT_DATA) {
+        iowrite32(rstat & ~MCASP_INT_DATA, handler->instance + MCASP_RSTAT_REG);
+    }
+
+    return IRQ_HANDLED;
+}
+
 static int Init_IRQ(cinp_handler_t *handler) {
     int ret;
 
@@ -142,6 +169,25 @@ static int Init_IRQ(cinp_handler_t *handler) {
     }
 
     pr_info("%s IRQ de TX registrada correctamente (IRQ %d)\n", __MODULE_NAME__, handler->irq_tx);
+
+    handler->irq_rx = platform_get_irq_byname(handler->pdev, "rx");
+    if (handler->irq_rx < 0) {
+        dev_err(&handler->pdev->dev, "No se pudo obtener la IRQ de RX desde el DT: %d\n", handler->irq_rx);
+        return handler->irq_rx;
+    }
+
+    ret = devm_request_irq(&handler->pdev->dev,
+                           handler->irq_rx,
+                           isr_rx_mcasp,
+                           0,
+                           "td3_i2s_rx",
+                           handler);
+    if (ret) {
+        dev_err(&handler->pdev->dev, "Error al registrar isr_rx_mcasp (IRQ %d): %d\n", handler->irq_rx, ret);
+        return ret;
+    }
+
+    pr_info("%s IRQ de RX registrada correctamente (IRQ %d)\n", __MODULE_NAME__, handler->irq_rx);
     return 0;
 }
 
@@ -528,6 +574,11 @@ static int cinp_open(struct inode *inode, struct file *file) {
     // Mantener la IRQ de TX deshabilitada hasta que write() cargue datos en tx_buf
     iowrite32(0, handler->instance + MCASP_XINTCTL_REG);
 
+    // Vaciar RBUF1, limpiar RSTAT y habilitar la interrupción de recepción (RDATA)
+    (void)MCASP_READ_RX_BUF(handler);
+    iowrite32(0xFFFF, handler->instance + MCASP_RSTAT_REG);
+    iowrite32(MCASP_INT_DATA, handler->instance + MCASP_RINTCTL_REG);
+
     pr_info("%s Device opened\n", __MODULE_NAME__);
     return 0;
 }
@@ -538,9 +589,10 @@ static int cinp_close(struct inode *inode, struct file *file) {
     if (handler) {
         // Detener transferencias y apagar el reloj del periférico
         if (handler->clk_enabled) {
-            // Deshabilitar interrupciones de TX, vaciar los buffers de 32 bits de hardware RX (RBUF1) y TX (XBUF0) y limpiar estados
+            // Deshabilitar interrupciones de TX y RX, vaciar los buffers de 32 bits de hardware RX (RBUF1) y TX (XBUF0) y limpiar estados
             if (handler->instance) {
                 iowrite32(0, handler->instance + MCASP_XINTCTL_REG);
+                iowrite32(0, handler->instance + MCASP_RINTCTL_REG);
                 (void)MCASP_READ_RX_BUF(handler);
                 iowrite32(0, handler->instance + MCASP_XBUF0_REG);
                 iowrite32(0xFFFF, handler->instance + MCASP_RSTAT_REG);
@@ -868,6 +920,7 @@ static void cinp_remove(struct platform_device *pdev)
     if (cinp_resource->clk_enabled) {
         if (cinp_resource->instance) {
             iowrite32(0, cinp_resource->instance + MCASP_XINTCTL_REG);
+            iowrite32(0, cinp_resource->instance + MCASP_RINTCTL_REG);
         }
         mcasp_reg_config(cinp_resource, false);
         if (cinp_resource->fck) {

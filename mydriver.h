@@ -82,6 +82,7 @@ typedef struct {
 
     // Interrupciones
     int irq_tx;
+    int irq_rx;
 
     // Exclusión mutua para open/close
     struct mutex lock;
