@@ -1,4 +1,4 @@
-MODULE_NAME := mydriver
+MODULE_NAME := td3_i2s
 
 ARCH ?= arm
 CROSS_COMPILE ?= arm-linux-gnueabihf-
@@ -10,6 +10,7 @@ OUTPUT_DIR ?= $(PWD)/obj
 ccflags-y += -I$(PWD)
 
 obj-m := $(MODULE_NAME).o
+$(MODULE_NAME)-objs := mydriver.o utils.o
 
 all:
 	@mkdir -p $(OUTPUT_DIR)

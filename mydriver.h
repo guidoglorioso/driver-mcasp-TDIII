@@ -15,10 +15,11 @@
 #include <linux/delay.h>
 #include <linux/io.h>
 #include <linux/mutex.h>
+#include <linux/interrupt.h>
+#include "utils.h"
 
 #define CDEV_NBR 1
 #define CDEV_MINORBASE 0
-#define BUFF_SIZE 1024      
 
 #define MCASP_PFUNC_REG 0x10    /* Pin Function Register (0: McASP, 1: GPIO) */ 
 #define MCASP_PDIR_REG 0x14     /* Pin Direction Register (0: Input, 1: Output) */ 
@@ -46,6 +47,8 @@
 #define MCASP_XBUF0_REG   0x200 /* Transmit Buffer Register for Serializer 0 (AXR0) */
 #define MCASP_RBUF1_REG   0x284 /* Receive Buffer Register for Serializer 1 (AXR1) */
 
+#define MCASP_INT_DATA    (1 << 5) /* Bit 5 de XINTCTL/XSTAT: XDATA / RDATA */
+
 #define MCASP_WRITE_TX_BUF(handler, word) iowrite32((uint32_t)(word), (handler)->instance + MCASP_XBUF0_REG)
 #define MCASP_READ_RX_BUF(handler)        ioread32((handler)->instance + MCASP_RBUF1_REG)
 
@@ -68,15 +71,17 @@ typedef struct {
     struct platform_device *pdev;
     chardev_t cinp_cstm_cdev;
 
-    // Buffer de chardev.
-    char buffer[BUFF_SIZE];
-    size_t buffer_len;
-    uint32_t buffer_head;
+    // Buffers circulares de Tx y Rx
+    circ_buf_t tx_buf;
+    circ_buf_t rx_buf;
 
     // Memoria de I2s y Clk
     void __iomem *instance;
     struct clk *fck;
     bool clk_enabled;
+
+    // Interrupciones
+    int irq_tx;
 
     // Exclusión mutua para open/close
     struct mutex lock;

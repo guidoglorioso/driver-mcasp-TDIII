@@ -49,9 +49,38 @@ static void mcasp_wait_gblctl(cinp_handler_t *handler, uint32_t mask) {
     }
 }
 
-static void mcasp_write_tx_word(cinp_handler_t *handler, uint32_t word) {
-    uint32_t xstat = ioread32(handler->instance + MCASP_XSTAT_REG);
-    uint32_t gbl   = ioread32(handler->instance + MCASP_GBLCTL_REG);
+static irqreturn_t isr_tx_mcasp(int irq, void *dev_id) {
+    cinp_handler_t *handler = (cinp_handler_t *)dev_id;
+    uint32_t xstat;
+    uint32_t gbl;
+    uint32_t word = 0;
+    uint32_t reg_val;
+    uint8_t byte;
+    static uint32_t cont = 0;
+    if (!handler || !handler->instance || !handler->clk_enabled)
+        return IRQ_NONE;
+
+    /*
+     * Extraer la palabra desde el buffer circular de TX (tx_buf).
+     * Si cb_pop devuelve -ENODATA (buffer vacío), deshabilitamos la interrupción
+     * XDATA en XINTCTL para evitar un interrupt storm.
+     */
+    if (cb_pop(&handler->tx_buf, &byte) == -ENODATA) {
+        reg_val = ioread32(handler->instance + MCASP_XINTCTL_REG);
+        reg_val &= ~MCASP_INT_DATA;
+        iowrite32(reg_val, handler->instance + MCASP_XINTCTL_REG);
+        pr_info("Se entro %d veces en el reset\n", cont);
+    
+        return IRQ_HANDLED;
+    }
+
+    word = ((uint32_t)byte << 24);
+    if (cb_pop(&handler->tx_buf, &byte) == 0) word |= ((uint32_t)byte << 16);
+    if (cb_pop(&handler->tx_buf, &byte) == 0) word |= ((uint32_t)byte << 8);
+    if (cb_pop(&handler->tx_buf, &byte) == 0) word |= ((uint32_t)byte << 0);
+   
+    xstat = ioread32(handler->instance + MCASP_XSTAT_REG);
+    gbl   = ioread32(handler->instance + MCASP_GBLCTL_REG);
 
     /*
      * Si el transmisor entró en Underrun (bit 0 de XSTAT) mientras estaba inactivo
@@ -59,7 +88,8 @@ static void mcasp_write_tx_word(cinp_handler_t *handler, uint32_t word) {
      * resetear XSMRST/XSRCLR, limpiar XSTAT, cargar XBUF0 y recién liberar XSMRST/XFRST.
      */
     if ((xstat & 0x1) || !(gbl & (1 << 11))) {
-        uint32_t reg_val = ioread32(handler->instance + MCASP_XGBLCTL_REG);
+        cont++;
+        reg_val = ioread32(handler->instance + MCASP_XGBLCTL_REG);
         reg_val &= ~((1 << 12) | (1 << 11) | (1 << 10));
         iowrite32(reg_val, handler->instance + MCASP_XGBLCTL_REG);
         udelay(5);
@@ -83,9 +113,36 @@ static void mcasp_write_tx_word(cinp_handler_t *handler, uint32_t word) {
         reg_val |= (1 << 12);
         iowrite32(reg_val, handler->instance + MCASP_XGBLCTL_REG);
         mcasp_wait_gblctl(handler, (1 << 12));
+
     } else {
         iowrite32(word, handler->instance + MCASP_XBUF0_REG);
     }
+
+    return IRQ_HANDLED;
+}
+
+static int Init_IRQ(cinp_handler_t *handler) {
+    int ret;
+
+    handler->irq_tx = platform_get_irq_byname(handler->pdev, "tx");
+    if (handler->irq_tx < 0) {
+        dev_err(&handler->pdev->dev, "No se pudo obtener la IRQ de TX desde el DT: %d\n", handler->irq_tx);
+        return handler->irq_tx;
+    }
+
+    ret = devm_request_irq(&handler->pdev->dev,
+                           handler->irq_tx,
+                           isr_tx_mcasp,
+                           0,
+                           "td3_i2s_tx",
+                           handler);
+    if (ret) {
+        dev_err(&handler->pdev->dev, "Error al registrar isr_tx_mcasp (IRQ %d): %d\n", handler->irq_tx, ret);
+        return ret;
+    }
+
+    pr_info("%s IRQ de TX registrada correctamente (IRQ %d)\n", __MODULE_NAME__, handler->irq_tx);
+    return 0;
 }
 
 static void I2S_mode(cinp_handler_t *handler, uint8_t mode) {
@@ -394,28 +451,42 @@ static void mcasp_reg_config(cinp_handler_t *handler, bool enable){
 
 static ssize_t lectura_show(struct device *dev, struct device_attribute *attr, char *buf) {
     cinp_handler_t *handler = dev_get_drvdata(dev);
+    uint8_t *tmp;
+    size_t i = 0;
+    uint8_t byte;
+    ssize_t ret;
 
     if(!handler)
         return -ENODEV;
 
-    return sysfs_emit(buf, "%.*s\n", (int)handler->buffer_len, handler->buffer);
+    tmp = kmalloc(BUFF_SIZE, GFP_KERNEL);
+    if (!tmp)
+        return -ENOMEM;
+
+    while (i < BUFF_SIZE && cb_pop(&handler->rx_buf, &byte) == 0) {
+        tmp[i++] = byte;
+    }
+
+    ret = sysfs_emit(buf, "%.*s\n", (int)i, tmp);
+    kfree(tmp);
+    return ret;
 }
 
 static DEVICE_ATTR_RO(lectura); 
 
 static ssize_t escritura_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count) {
     cinp_handler_t *handler = dev_get_drvdata(dev);
-    size_t length;
+    size_t i;
 
     if(!handler)
         return -ENODEV;
 
-    length = (count < BUFF_SIZE) ? count : BUFF_SIZE;
+    for (i = 0; i < count; i++) {
+        if (cb_push(&handler->tx_buf, (uint8_t)buf[i]) != 0)
+            break;
+    }
 
-    memcpy(handler->buffer, buf, length);
-    handler->buffer_len = length;
-
-    return count;
+    return i;
 }
 
 static DEVICE_ATTR_WO(escritura);
@@ -450,10 +521,12 @@ static int cinp_open(struct inode *inode, struct file *file) {
     // TODO: REMOVER -- (Hardcodeo que arranque en master)
     I2S_mode(handler, MASTER);
 
-    // TODO: REMOVER -- Prueba de transmisión en el open: enviar palabra 0xAAFFAAFF por P9_30 (AXR0)
-    mcasp_write_tx_word(handler, 0xAAFFAAFF);
+    // Resetear índices de los buffers circulares de Tx y Rx
+    cb_reset(&handler->tx_buf);
+    cb_reset(&handler->rx_buf);
 
-    handler->buffer_head = 0; 
+    // Mantener la IRQ de TX deshabilitada hasta que write() cargue datos en tx_buf
+    iowrite32(0, handler->instance + MCASP_XINTCTL_REG);
 
     pr_info("%s Device opened\n", __MODULE_NAME__);
     return 0;
@@ -465,8 +538,9 @@ static int cinp_close(struct inode *inode, struct file *file) {
     if (handler) {
         // Detener transferencias y apagar el reloj del periférico
         if (handler->clk_enabled) {
-            // Vaciar los buffers de 32 bits de hardware RX (RBUF1) y TX (XBUF0) y limpiar estados
+            // Deshabilitar interrupciones de TX, vaciar los buffers de 32 bits de hardware RX (RBUF1) y TX (XBUF0) y limpiar estados
             if (handler->instance) {
+                iowrite32(0, handler->instance + MCASP_XINTCTL_REG);
                 (void)MCASP_READ_RX_BUF(handler);
                 iowrite32(0, handler->instance + MCASP_XBUF0_REG);
                 iowrite32(0xFFFF, handler->instance + MCASP_RSTAT_REG);
@@ -479,7 +553,8 @@ static int cinp_close(struct inode *inode, struct file *file) {
             }
             handler->clk_enabled = false;
         }
-        handler->buffer_head = 0;
+        cb_reset(&handler->tx_buf);
+        cb_reset(&handler->rx_buf);
         mutex_unlock(&handler->lock);
     }
 
@@ -489,17 +564,22 @@ static int cinp_close(struct inode *inode, struct file *file) {
 }
 
 static ssize_t cinp_read(struct file *file, char __user *buf, size_t len, loff_t *offset) {
-    
+    cinp_handler_t *dev = file->private_data;
+    ssize_t ret = 0;
+    size_t read_bytes = 0;
+    uint8_t *kbuff;
+    uint8_t byte;
+
     pr_info("%s Device read\n", __MODULE_NAME__);
 
-    cinp_handler_t *dev = file->private_data;
+    if (len == 0)
+        return 0;
+        
+    if (len > BUFF_SIZE)    
+        len = BUFF_SIZE;
 
-    ssize_t ret = 0;
-    void *kbuff;
-
-    if(len > dev->buffer_head) {
-        len = dev->buffer_head; // Limitar len al tamaño del buffer
-    }
+    if (len > BUFF_SIZE)
+        len = BUFF_SIZE;
 
     kbuff = kmalloc(len, GFP_KERNEL);
     if (kbuff == NULL) {
@@ -507,40 +587,34 @@ static ssize_t cinp_read(struct file *file, char __user *buf, size_t len, loff_t
         return -ENOMEM;
     }
 
-    memcpy(kbuff, &dev->buffer[0], len); // Copiar datos al buffer temporal
+    while (read_bytes < len && cb_pop(&dev->rx_buf, &byte) == 0) {
+        kbuff[read_bytes++] = byte;
+    }
 
-    if (copy_to_user(buf, kbuff, len)) {
-        ret = -EFAULT;
-    } else {
-        *offset += len; // Actualizamos la posición real de lectura
-        ret = len;
+    if (read_bytes > 0) {
+        if (copy_to_user(buf, kbuff, read_bytes)) {
+            ret = -EFAULT;
+        } else {
+            ret = read_bytes;
+        }
     }
 
     kfree(kbuff);
-    
     return ret;
-
 }
 
 
 
 static ssize_t cinp_write(struct file *file, const char __user *buf, size_t len, loff_t *offset) {
-
     cinp_handler_t *dev = file->private_data;
-    ssize_t ret = 0;
-    void *kbuff;
-
-    // Si head != 0, todavía hay datos sin vaciar/enviar en el buffer: retornar 0 bytes copiados
-    if (dev->buffer_head != 0) {
-        return 0;
-    }
-
-    if (len > dev->buffer_len) {
-        len = dev->buffer_len; // Limitar len al tamaño del buffer
-    }
+    size_t written = 0;
+    uint8_t *kbuff;
 
     if (len == 0)
         return 0;
+
+    if (len > BUFF_SIZE)
+        len = BUFF_SIZE;
 
     kbuff = kmalloc(len, GFP_KERNEL);
     if (kbuff == NULL) {
@@ -549,17 +623,29 @@ static ssize_t cinp_write(struct file *file, const char __user *buf, size_t len,
     }
 
     if (copy_from_user(kbuff, buf, len)) {
-        ret = -EFAULT;
-    } else {
-        memcpy(dev->buffer, kbuff, len); // Copiar datos del buffer temporal al buffer del dispositivo
-        dev->buffer_head = len;
-        ret = len;
+        kfree(kbuff);
+        return -EFAULT;
     }
+
+    // Enviar a al buffer de tx
+    while (written < len) {
+        if (cb_push(&dev->tx_buf, kbuff[written]) != 0)
+            break;
+        written++;
+    }
+
     kfree(kbuff);
 
-    pr_info("%s Device write\n", __MODULE_NAME__);
+    // Si se cargaron datos, habilitar la interrupción XDATA de TX para que isr_tx_mcasp los consuma
+    if (written > 0 && dev->instance) {
+        uint32_t reg_val = ioread32(dev->instance + MCASP_XINTCTL_REG);
+        reg_val |= MCASP_INT_DATA;
+        iowrite32(reg_val, dev->instance + MCASP_XINTCTL_REG);
+    }
 
-    return ret;
+    pr_info("%s Device write (%zu bytes)\n", __MODULE_NAME__, written);
+
+    return written;
 }
 
 
@@ -596,7 +682,8 @@ static int cinp_probe(struct platform_device *pdev)
         return -ENOMEM;
 
     cinp_resource->pdev = pdev;
-    cinp_resource->buffer_len = BUFF_SIZE;
+    cb_init(&cinp_resource->tx_buf);
+    cb_init(&cinp_resource->rx_buf);
     cinp_resource->clk_enabled = false;
     mutex_init(&cinp_resource->lock);
     
@@ -616,6 +703,7 @@ static int cinp_probe(struct platform_device *pdev)
     
     if (pdev->dev.of_node) {
         status = of_property_read_u32(pdev->dev.of_node, "utn,frecuencia", &cinp_resource->hertz);
+        // cinp_resource->hertz = 10000; // TODO BORRAR
         if (status < 0) cinp_resource->hertz = 1000;
         
         status = of_property_read_u32(pdev->dev.of_node, "square_on", &cinp_resource->square_on);
@@ -745,6 +833,19 @@ static int cinp_probe(struct platform_device *pdev)
         return status;
     }
 
+    // Registrar la interrupción de TX del McASP
+    status = Init_IRQ(cinp_resource);
+    if (status < 0) {
+        device_remove_file(&pdev->dev, &dev_attr_escritura);
+        device_remove_file(&pdev->dev, &dev_attr_lectura);
+        platform_set_drvdata(pdev, NULL);
+        device_destroy(cinp_class, cinp_resource->cinp_cstm_cdev.cinp_dev);
+        cinp_resource->cinp_device = NULL;
+        cdev_del(&cinp_resource->cinp_cstm_cdev.cinp_cdev);
+        unregister_chrdev_region(cinp_resource->cinp_cstm_cdev.cinp_dev, CDEV_NBR);
+        return status;
+    }
+
     pr_info("%s Device registered successfully\n", __MODULE_NAME__);
 
     pr_info("%s Major: %d, Minor: %d\n",
@@ -765,6 +866,9 @@ static void cinp_remove(struct platform_device *pdev)
 
     // Si quedó abierto/encendido, detener hardware y apagar el reloj
     if (cinp_resource->clk_enabled) {
+        if (cinp_resource->instance) {
+            iowrite32(0, cinp_resource->instance + MCASP_XINTCTL_REG);
+        }
         mcasp_reg_config(cinp_resource, false);
         if (cinp_resource->fck) {
             clk_disable_unprepare(cinp_resource->fck);
