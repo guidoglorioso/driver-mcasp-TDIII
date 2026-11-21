@@ -9,7 +9,6 @@ MODULE_DESCRIPTION("Un driver de ejemplo");
 /*
 
 * Funcionamiento
-    - Probar que se genere el clock al hacer el probe y que se apague si se retira el driver.
     - Realizar el manejo de buffers del driver.
     - Probar el envio de datos por el pin de datos.
 
@@ -454,6 +453,8 @@ static int cinp_open(struct inode *inode, struct file *file) {
     // TODO: REMOVER -- Prueba de transmisión en el open: enviar palabra 0xAAFFAAFF por P9_30 (AXR0)
     mcasp_write_tx_word(handler, 0xAAFFAAFF);
 
+    handler->buffer_head = 0; 
+
     pr_info("%s Device opened\n", __MODULE_NAME__);
     return 0;
 }
@@ -464,12 +465,21 @@ static int cinp_close(struct inode *inode, struct file *file) {
     if (handler) {
         // Detener transferencias y apagar el reloj del periférico
         if (handler->clk_enabled) {
+            // Vaciar los buffers de 32 bits de hardware RX (RBUF1) y TX (XBUF0) y limpiar estados
+            if (handler->instance) {
+                (void)MCASP_READ_RX_BUF(handler);
+                iowrite32(0, handler->instance + MCASP_XBUF0_REG);
+                iowrite32(0xFFFF, handler->instance + MCASP_RSTAT_REG);
+                iowrite32(0xFFFF, handler->instance + MCASP_XSTAT_REG);
+            }
+
             mcasp_reg_config(handler, false);
             if (handler->fck) {
                 clk_disable_unprepare(handler->fck);
             }
             handler->clk_enabled = false;
         }
+        handler->buffer_head = 0;
         mutex_unlock(&handler->lock);
     }
 
@@ -487,8 +497,8 @@ static ssize_t cinp_read(struct file *file, char __user *buf, size_t len, loff_t
     ssize_t ret = 0;
     void *kbuff;
 
-    if(len > dev->buffer_len - *offset) {
-        len = dev->buffer_len - *offset; // Limitar len al tamaño del buffer
+    if(len > dev->buffer_head) {
+        len = dev->buffer_head; // Limitar len al tamaño del buffer
     }
 
     kbuff = kmalloc(len, GFP_KERNEL);
@@ -497,7 +507,7 @@ static ssize_t cinp_read(struct file *file, char __user *buf, size_t len, loff_t
         return -ENOMEM;
     }
 
-    memcpy(kbuff, dev->buffer + *offset, len); // Copiar datos al buffer temporal
+    memcpy(kbuff, &dev->buffer[0], len); // Copiar datos al buffer temporal
 
     if (copy_to_user(buf, kbuff, len)) {
         ret = -EFAULT;
@@ -519,11 +529,19 @@ static ssize_t cinp_write(struct file *file, const char __user *buf, size_t len,
     cinp_handler_t *dev = file->private_data;
     ssize_t ret = 0;
     void *kbuff;
-   
-    if( len >dev->buffer_len - *offset ) {
-        len = dev->buffer_len - *offset; // Limitar len al tamaño del buffer
+
+    // Si head != 0, todavía hay datos sin vaciar/enviar en el buffer: retornar 0 bytes copiados
+    if (dev->buffer_head != 0) {
+        return 0;
     }
-    
+
+    if (len > dev->buffer_len) {
+        len = dev->buffer_len; // Limitar len al tamaño del buffer
+    }
+
+    if (len == 0)
+        return 0;
+
     kbuff = kmalloc(len, GFP_KERNEL);
     if (kbuff == NULL) {
         pr_err("%s Failed to allocate memory\n", __MODULE_NAME__);
@@ -533,22 +551,15 @@ static ssize_t cinp_write(struct file *file, const char __user *buf, size_t len,
     if (copy_from_user(kbuff, buf, len)) {
         ret = -EFAULT;
     } else {
-        // Pisamos los valores previos
         memcpy(dev->buffer, kbuff, len); // Copiar datos del buffer temporal al buffer del dispositivo
-        dev->buffer_len = len; 
-        *offset += len; // Actualizamos la posición real de escritura
+        dev->buffer_head = len;
         ret = len;
     }
     kfree(kbuff);
 
     pr_info("%s Device write\n", __MODULE_NAME__);
 
-    return len;
-}
-
-static long cinp_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
-    pr_info("%s Device ioctl\n", __MODULE_NAME__);
-    return 0;
+    return ret;
 }
 
 
@@ -557,7 +568,6 @@ static struct file_operations cinp_fops = {
     .owner = THIS_MODULE,
     .read = cinp_read,
     .write = cinp_write,
-    .unlocked_ioctl = cinp_ioctl,
     .open = cinp_open,
     .release = cinp_close,
 };

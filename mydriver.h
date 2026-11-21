@@ -71,6 +71,7 @@ typedef struct {
     // Buffer de chardev.
     char buffer[BUFF_SIZE];
     size_t buffer_len;
+    uint32_t buffer_head;
 
     // Memoria de I2s y Clk
     void __iomem *instance;
