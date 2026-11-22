@@ -1,56 +1,31 @@
 #include "mydriver.h"
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Guido");
-MODULE_DESCRIPTION("Un driver de ejemplo");
+MODULE_AUTHOR("Guido Glorioso");
+MODULE_DESCRIPTION("Driver de MCASP TDIII");
 
+static const char __MODULE_NAME__[] = "mymcasp"; 
 
-// TODO
-/*
-
-* Funcionamiento
-    - Realizar el manejo de buffers del driver.
-    - Probar el envio de datos por el pin de datos.
-
-* Interfaz 
-    - master (Lectura / Escritura): 
-        - Escritura: Permite conmutar el modo de sincronismo de reloj (1 = Maestro, 0 = Esclavo). 
-        - Lectura: Retorna el estado operativo actual (1 o 0).
-    - recibir (Lectura): 
-        - Retorna últimos 4k leídos. Implementar un búfer circular interno de recepción con  tamaño superior a 4k. 
-    - transmitir (Escritura): 
-        - Permite escribir datos directamente a la cola de transmisión para su envío por la interfaz  I2S. 
-
-* Formalidades y miscelanea 
-    - Cambiar nombre del driver a td3_i2s.
-    - Impedir el open mientras exista una tarea usando el device. (EBUSY)
-    - Al cerrarse el descriptor del proceso activo, el hardware debe detenerse, suspender sus relojes y quedar habilitado para una posterior apertura
-    - Iniciar el device en modo slave.
-
-* Interrupciones
-    - Chequear su configuracion.
-    - Probar si estan activas (con un print).
-    - Colocar al proceso consumidor como TASK_INTERRUPTIBLE.
-
-
-*/
-static const char __MODULE_NAME__[] = "cin"; // No poner nombres raros por que no carga el driver sino. (todo junto sin caracter especiales)
-
-static struct class *cinp_class; // Necesario para crear el nodo en /dev
+static struct class *mymcasp_class; // Necesario para crear el nodo en /dev
 
 /////////////////////////
 // configuracion de HW
 /////////////////////////
 
-static void mcasp_wait_gblctl(cinp_handler_t *handler, uint32_t mask) {
+static void mcasp_wait_gblctl(mymcasp_handler_t *handler, uint32_t mask) {
     int timeout = 1000;
     while (((ioread32(handler->instance + MCASP_GBLCTL_REG) & mask) != mask) && --timeout > 0) {
         udelay(1);
     }
 }
 
+/////////////////////////
+// Handlers IRQ
+/////////////////////////
+
+// TODO Revisar registros, hacer clean 
 static irqreturn_t isr_tx_mcasp(int irq, void *dev_id) {
-    cinp_handler_t *handler = (cinp_handler_t *)dev_id;
+    mymcasp_handler_t *handler = (mymcasp_handler_t *)dev_id;
     uint32_t xstat;
     uint32_t gbl;
     uint32_t word = 0;
@@ -65,20 +40,26 @@ static irqreturn_t isr_tx_mcasp(int irq, void *dev_id) {
      * Si cb_pop devuelve -ENODATA (buffer vacío), deshabilitamos la interrupción
      * XDATA en XINTCTL para evitar un interrupt storm.
      */
+
     if (cb_pop(&handler->tx_buf, &byte) == -ENODATA) {
         reg_val = ioread32(handler->instance + MCASP_XINTCTL_REG);
         reg_val &= ~MCASP_INT_DATA;
         iowrite32(reg_val, handler->instance + MCASP_XINTCTL_REG);
-        pr_info("Se entro %d veces en el reset\n", cont);
+        //TODO Remover:
+        pr_info("Se reseteo la MDE %d veces durante el envio del buffer\n", cont);
+        cont = 0;
     
         return IRQ_HANDLED;
     }
+
+    // Formo word para enviar al buff del serializador
 
     word = ((uint32_t)byte << 24);
     if (cb_pop(&handler->tx_buf, &byte) == 0) word |= ((uint32_t)byte << 16);
     if (cb_pop(&handler->tx_buf, &byte) == 0) word |= ((uint32_t)byte << 8);
     if (cb_pop(&handler->tx_buf, &byte) == 0) word |= ((uint32_t)byte << 0);
    
+    // Registros de estado de MDE y modulo MCASP
     xstat = ioread32(handler->instance + MCASP_XSTAT_REG);
     gbl   = ioread32(handler->instance + MCASP_GBLCTL_REG);
 
@@ -88,24 +69,26 @@ static irqreturn_t isr_tx_mcasp(int irq, void *dev_id) {
      * resetear XSMRST/XSRCLR, limpiar XSTAT, cargar XBUF0 y recién liberar XSMRST/XFRST.
      */
     if ((xstat & 0x1) || !(gbl & (1 << 11))) {
+        // Debug
         cont++;
+
         reg_val = ioread32(handler->instance + MCASP_XGBLCTL_REG);
         reg_val &= ~((1 << 12) | (1 << 11) | (1 << 10));
         iowrite32(reg_val, handler->instance + MCASP_XGBLCTL_REG);
-        udelay(5);
+        udelay(5); // TODO Ver de remover delays
 
         // Limpiar todos los flags de estado/error de TX
         iowrite32(0xFFFF, handler->instance + MCASP_XSTAT_REG);
 
-        // 1) Activar serializer TX (XSRCLR = bit 10)
+        // Activar serializer TX (XSRCLR = bit 10)
         reg_val |= (1 << 10);
         iowrite32(reg_val, handler->instance + MCASP_XGBLCTL_REG);
         mcasp_wait_gblctl(handler, (1 << 10));
 
-        // 2) Cargar la palabra inicial en XBUF0 ANTES de soltar XSMRST
+        // Cargar la palabra inicial en XBUF0 ANTES de soltar XSMRST
         iowrite32(word, handler->instance + MCASP_XBUF0_REG);
 
-        // 3) Liberar máquina de estados TX (XSMRST = 11) y Frame Sync (XFRST = 12)
+        // Liberar máquina de estados TX (XSMRST = 11) y Frame Sync (XFRST = 12)
         reg_val |= (1 << 11);
         iowrite32(reg_val, handler->instance + MCASP_XGBLCTL_REG);
         mcasp_wait_gblctl(handler, (1 << 11));
@@ -120,9 +103,9 @@ static irqreturn_t isr_tx_mcasp(int irq, void *dev_id) {
 
     return IRQ_HANDLED;
 }
-
+// TODO Revisar registros, hacer clean
 static irqreturn_t isr_rx_mcasp(int irq, void *dev_id) {
-    cinp_handler_t *handler = (cinp_handler_t *)dev_id;
+    mymcasp_handler_t *handler = (mymcasp_handler_t *)dev_id;
     uint32_t rstat;
     uint32_t word;
 
@@ -148,12 +131,16 @@ static irqreturn_t isr_rx_mcasp(int irq, void *dev_id) {
     return IRQ_HANDLED;
 }
 
-static int Init_IRQ(cinp_handler_t *handler) {
+/////////////////////////
+// Rutinas de inicializacion
+/////////////////////////
+
+static int init_irq(mymcasp_handler_t *handler) {
     int ret;
 
     handler->irq_tx = platform_get_irq_byname(handler->pdev, "tx");
     if (handler->irq_tx < 0) {
-        dev_err(&handler->pdev->dev, "No se pudo obtener la IRQ de TX desde el DT: %d\n", handler->irq_tx);
+        pr_err("No se pudo obtener la IRQ de TX desde el DT: %d\n", handler->irq_tx);
         return handler->irq_tx;
     }
 
@@ -164,15 +151,13 @@ static int Init_IRQ(cinp_handler_t *handler) {
                            "td3_i2s_tx",
                            handler);
     if (ret) {
-        dev_err(&handler->pdev->dev, "Error al registrar isr_tx_mcasp (IRQ %d): %d\n", handler->irq_tx, ret);
+        pr_err("Error al registrar isr_tx_mcasp (IRQ %d): %d\n", handler->irq_tx, ret);
         return ret;
     }
 
-    pr_info("%s IRQ de TX registrada correctamente (IRQ %d)\n", __MODULE_NAME__, handler->irq_tx);
-
     handler->irq_rx = platform_get_irq_byname(handler->pdev, "rx");
     if (handler->irq_rx < 0) {
-        dev_err(&handler->pdev->dev, "No se pudo obtener la IRQ de RX desde el DT: %d\n", handler->irq_rx);
+        pr_err("No se pudo obtener la IRQ de RX desde el DT: %d\n", handler->irq_rx);
         return handler->irq_rx;
     }
 
@@ -183,16 +168,28 @@ static int Init_IRQ(cinp_handler_t *handler) {
                            "td3_i2s_rx",
                            handler);
     if (ret) {
-        dev_err(&handler->pdev->dev, "Error al registrar isr_rx_mcasp (IRQ %d): %d\n", handler->irq_rx, ret);
+        pr_err("Error al registrar isr_rx_mcasp (IRQ %d): %d\n", handler->irq_rx, ret);
         return ret;
     }
-
-    pr_info("%s IRQ de RX registrada correctamente (IRQ %d)\n", __MODULE_NAME__, handler->irq_rx);
+    
     return 0;
 }
 
-static void I2S_mode(cinp_handler_t *handler, uint8_t mode) {
+// TODO Revisar registros, hacer clean
+static int set_i2s_mode(mymcasp_handler_t *handler, uint8_t mode) {
     uint32_t reg_val;
+
+    if (!handler || !handler->instance)
+        return -ENODEV;
+
+    if (mode != SLAVE && mode != MASTER)
+        return -EINVAL;
+
+    // Si el clock no está activo, guardar el modo para aplicarlo en la inicialización sin acceder a registros
+    if (!handler->clk_enabled) {
+        handler->i2s_mode = mode;
+        return 0;
+    }
 
     if (mode == MASTER) {
         // CLKXM (bit 5) = 1: Clock de bits (ACLKX) generado internamente
@@ -266,16 +263,19 @@ static void I2S_mode(cinp_handler_t *handler, uint8_t mode) {
         reg_val &= ~(1 << 1);
         iowrite32(reg_val, handler->instance + MCASP_AFSXCTL_REG);
     }
+
+    handler->i2s_mode = mode;
+    return 0;
 }
 
-static int Init_clock(cinp_handler_t *handler) {
+static int init_clock(mymcasp_handler_t *handler) {
     int ret;
 
     if (!handler->fck) {
         handler->fck = devm_clk_get(&handler->pdev->dev, "fck");
         if (IS_ERR(handler->fck)) {
             ret = PTR_ERR(handler->fck);
-            dev_err(&handler->pdev->dev, "No se pudo obtener el reloj fck: %d\n", ret);
+            pr_err("No se pudo obtener el reloj fck: %d\n", ret);
             handler->fck = NULL;
             return ret;
         }
@@ -284,7 +284,7 @@ static int Init_clock(cinp_handler_t *handler) {
     if (!handler->clk_enabled) {
         ret = clk_prepare_enable(handler->fck);
         if (ret) {
-            dev_err(&handler->pdev->dev, "Error al habilitar el reloj fck: %d\n", ret);
+            pr_err("Error al habilitar el reloj fck: %d\n", ret);
             return ret;
         }
         handler->clk_enabled = true;
@@ -293,7 +293,7 @@ static int Init_clock(cinp_handler_t *handler) {
     return 0;
 }
 
-static void Init_GPIO(cinp_handler_t *handler) {
+static void init_gpio(mymcasp_handler_t *handler) {
     uint32_t reg_val;
 
     if (!handler->instance)
@@ -305,14 +305,15 @@ static void Init_GPIO(cinp_handler_t *handler) {
     iowrite32(reg_val, handler->instance + MCASP_PFUNC_REG);
 
     // Seteo de pin de datos TX (Bit 0: AXR0) como salida y RX (Bit 1: AXR1) como entrada.
-    // Los pines de WS (Bit 28: AFSX) y CLK (Bit 26: ACLKX) los maneja I2S_mode().
+    // Nota: Los pines de WS (Bit 28: AFSX) y CLK (Bit 26: ACLKX) los maneja set_i2s_mode().
     reg_val = ioread32(handler->instance + MCASP_PDIR_REG);
     reg_val |= (1 << 0);
     reg_val &= ~(1 << 1);
     iowrite32(reg_val, handler->instance + MCASP_PDIR_REG);
 }
 
-static void mcasp_reg_config(cinp_handler_t *handler, bool enable){
+// TODO Revisar registros, hacer clean
+static void mcasp_reg_config(mymcasp_handler_t *handler, bool enable){
     
     uint32_t target_freq = handler->hertz;
     uint32_t total_div;
@@ -353,7 +354,7 @@ static void mcasp_reg_config(cinp_handler_t *handler, bool enable){
     }
 
     // Por defecto iniciamos en modo SLAVE (WS y CLK como entradas externas)
-    I2S_mode(handler, SLAVE);
+    set_i2s_mode(handler, SLAVE);
 
     // Configurar divisores de reloj
 
@@ -364,7 +365,7 @@ static void mcasp_reg_config(cinp_handler_t *handler, bool enable){
     reg_val |= (1 << 15)|(ahclk_div & 0xFFF);
     iowrite32(reg_val, handler->instance + MCASP_AHCLKXCTL_REG); 
 
-    // Polaridad y divisor en Tx (sin tocar CLKXM bit 5, que lo maneja I2S_mode)
+    // Polaridad y divisor en Tx (sin tocar CLKXM bit 5, que lo maneja set_i2s_mode)
     //CLKXP (7) Transmit bitstream clock polarity select bit | 0h = Rising edge.
     //ASYNC (6) Transmit/receive operation asynchronous enable bit | 0h = Synchronous (RX usa el mismo CLK y WS que TX).
     //CLKXDIV (4-0) Transmit bit clock divide ratio bits determine the divide-down ratio from AHCLKX to ACLKX
@@ -492,80 +493,66 @@ static void mcasp_reg_config(cinp_handler_t *handler, bool enable){
     
 }
 
+static void mymcasp_hw_deinit(mymcasp_handler_t *handler) {
+    if (!handler)
+        return;
 
-// Funciones para manejar los atributos de sysfs
+    // Detener transferencias y apagar el reloj del periférico
+    if (handler->clk_enabled) {
+        // Deshabilitar interrupciones de TX y RX, vaciar los buffers de 32 bits de hardware RX (RBUF1) y TX (XBUF0) y limpiar estados
+        if (handler->instance) {
+            iowrite32(0, handler->instance + MCASP_XINTCTL_REG);
+            iowrite32(0, handler->instance + MCASP_RINTCTL_REG);
+            (void)MCASP_READ_RX_BUF(handler);
+            iowrite32(0, handler->instance + MCASP_XBUF0_REG);
+            iowrite32(0xFFFF, handler->instance + MCASP_RSTAT_REG);
+            iowrite32(0xFFFF, handler->instance + MCASP_XSTAT_REG);
+        }
 
-static ssize_t lectura_show(struct device *dev, struct device_attribute *attr, char *buf) {
-    cinp_handler_t *handler = dev_get_drvdata(dev);
-    uint8_t *tmp;
-    size_t i = 0;
-    uint8_t byte;
-    ssize_t ret;
-
-    if(!handler)
-        return -ENODEV;
-
-    tmp = kmalloc(BUFF_SIZE, GFP_KERNEL);
-    if (!tmp)
-        return -ENOMEM;
-
-    while (i < BUFF_SIZE && cb_pop(&handler->rx_buf, &byte) == 0) {
-        tmp[i++] = byte;
+        mcasp_reg_config(handler, false);
+        if (handler->fck) {
+            clk_disable_unprepare(handler->fck);
+        }
+        handler->clk_enabled = false;
     }
 
-    ret = sysfs_emit(buf, "%.*s\n", (int)i, tmp);
-    kfree(tmp);
-    return ret;
+    cb_reset(&handler->tx_buf);
+    cb_reset(&handler->rx_buf);
 }
 
-static DEVICE_ATTR_RO(lectura); 
-
-static ssize_t escritura_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count) {
-    cinp_handler_t *handler = dev_get_drvdata(dev);
-    size_t i;
-
-    if(!handler)
-        return -ENODEV;
-
-    for (i = 0; i < count; i++) {
-        if (cb_push(&handler->tx_buf, (uint8_t)buf[i]) != 0)
-            break;
-    }
-
-    return i;
-}
-
-static DEVICE_ATTR_WO(escritura);
-// static DEVICE_ATTR_(escritura, 0220, NULL, escritura_store); // Alternativa para definir permisos
-
-static int cinp_open(struct inode *inode, struct file *file) {
+static int mymcasp_hw_init(mymcasp_handler_t *handler) {
     int status;
-    // Recuperamos nuestra estructura a través del cdev contenido en el inode
-    cinp_handler_t *handler = container_of(inode->i_cdev, cinp_handler_t, cinp_cstm_cdev.cinp_cdev);
+    uint8_t target_mode;
 
-    // Exclusión mutua: si el dispositivo ya está abierto por otro proceso, retornar -EBUSY
-    if (!mutex_trylock(&handler->lock)) {
-        pr_warn("%s Device busy\n", __MODULE_NAME__);
-        return -EBUSY;
-    }
+    if (!handler || !handler->instance)
+        return -ENODEV;
 
-    file->private_data = handler;
+    if (handler->clk_enabled)
+        return 0;
 
-    // ENCENDER EL RELOJ
-    status = Init_clock(handler);
-    if (status) {
-        mutex_unlock(&handler->lock);
+    // Aplicar el modo configurado (SLAVE o MASTER); si es NOT_INIT, usar SLAVE por defecto
+    if (handler->i2s_mode == MASTER || handler->i2s_mode == SLAVE)
+        target_mode = handler->i2s_mode;
+    else
+        target_mode = SLAVE;
+
+    // Clock Gating
+    status = init_clock(handler);
+    if (status)
         return status;
-    }
 
-    // CONFIGURAR PINES DEL MCASP (PFUNC y PDIR)
-    Init_GPIO(handler);
+    // Config de pines (PFUNC y PDIR)
+    init_gpio(handler);
 
-    // Inicializa el McASP (default SLAVE)
+    // Inicializa el McASP (arranca en SLAVE durante la configuración)
     mcasp_reg_config(handler, true);
 
-    // TODO: REMOVER -- (Hardcodeo que arranque en master)
-    I2S_mode(handler, MASTER);
+    // Aplicar el modo correspondiente (SLAVE por default o MASTER)
+    status = set_i2s_mode(handler, target_mode);
+    if (status) {
+        mymcasp_hw_deinit(handler);
+        return status;
+    }
 
     // Resetear índices de los buffers circulares de Tx y Rx
     cb_reset(&handler->tx_buf);
@@ -579,50 +566,239 @@ static int cinp_open(struct inode *inode, struct file *file) {
     iowrite32(0xFFFF, handler->instance + MCASP_RSTAT_REG);
     iowrite32(MCASP_INT_DATA, handler->instance + MCASP_RINTCTL_REG);
 
-    pr_info("%s Device opened\n", __MODULE_NAME__);
     return 0;
 }
 
-static int cinp_close(struct inode *inode, struct file *file) {
-    cinp_handler_t *handler = file->private_data;
+
+/////////////////////////
+// Interfaz Sysfs - (/sys/class/td3_i2s/) 
+/////////////////////////
+
+static ssize_t master_show(struct device *dev, struct device_attribute *attr, char *buf) {
+    mymcasp_handler_t *handler = dev_get_drvdata(dev);
+    ssize_t ret;
+
+    if (!handler || !handler->instance)
+        return -ENODEV;
+
+    if (!mutex_trylock(&handler->lock))
+        return -EBUSY;
+
+    if (handler->i2s_mode == NOT_INIT)
+        ret = -ENODEV;
+    else
+        ret = sysfs_emit(buf, "%u\n", handler->i2s_mode);
+
+    mutex_unlock(&handler->lock);
+    return ret;
+}
+
+static ssize_t master_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count) {
+    mymcasp_handler_t *handler = dev_get_drvdata(dev);
+    char kbuf[16];
+    char *arg;
+    size_t len;
+    uint8_t mode;
+    int ret;
+
+    if (!handler || !handler->instance)
+        return -ENODEV;
+
+    if (!mutex_trylock(&handler->lock))
+        return -EBUSY;
+
+    if (count == 0) {
+        mutex_unlock(&handler->lock);
+        return -EINVAL;
+    }
+
+    len = min(count, sizeof(kbuf) - 1);
+    memcpy(kbuf, buf, len);
+    kbuf[len] = '\0';
+    arg = strim(kbuf);
+
+    if (strcmp(arg, "1") == 0 || strcasecmp(arg, "MASTER") == 0 || strcasecmp(arg, "MAESTRO") == 0) {
+        mode = MASTER;
+    } else if (strcmp(arg, "0") == 0 || strcasecmp(arg, "SLAVE") == 0 || strcasecmp(arg, "ESCLAVO") == 0) {
+        mode = SLAVE;
+    } else {
+        mutex_unlock(&handler->lock);
+        return -EINVAL;
+    }
+
+    ret = set_i2s_mode(handler, mode);
+    mutex_unlock(&handler->lock);
+    if (ret < 0)
+        return ret;
+
+    return count;
+}
+
+static DEVICE_ATTR_RW(master);
+
+static ssize_t recibir_read(struct file *filp, struct kobject *kobj,
+                            struct bin_attribute *attr, char *buf,
+                            loff_t off, size_t count) {
+    mymcasp_handler_t *handler = dev_get_drvdata(kobj_to_dev(kobj));
+    size_t read_bytes = 0;
+    uint8_t byte;
+    int ret;
+
+    if (!handler || !handler->instance)
+        return -ENODEV;
+
+    if (!mutex_trylock(&handler->lock))
+        return -EBUSY;
+
+    ret = mymcasp_hw_init(handler);
+    if (ret < 0) {
+        mutex_unlock(&handler->lock);
+        return ret;
+    }
+
+    if (count == 0) {
+        mymcasp_hw_deinit(handler);
+        mutex_unlock(&handler->lock);
+        return 0;
+    }
+
+    if (count > BUFF_SIZE)
+        count = BUFF_SIZE;
+
+    while (read_bytes < count && cb_pop(&handler->rx_buf, &byte) == 0) {
+        buf[read_bytes++] = (char)byte;
+    }
+
+    mymcasp_hw_deinit(handler);
+    mutex_unlock(&handler->lock);
+    return read_bytes;
+}
+
+static BIN_ATTR_RO(recibir, 0);
+
+static ssize_t transmitir_write(struct file *filp, struct kobject *kobj,
+                                struct bin_attribute *attr, char *buf,
+                                loff_t off, size_t count) {
+    mymcasp_handler_t *handler = dev_get_drvdata(kobj_to_dev(kobj));
+    size_t written = 0;
+    uint32_t reg_val;
+    int ret;
+
+    if (!handler || !handler->instance)
+        return -ENODEV;
+
+    if (!mutex_trylock(&handler->lock))
+        return -EBUSY;
+
+    ret = mymcasp_hw_init(handler);
+    if (ret < 0) {
+        mutex_unlock(&handler->lock);
+        return ret;
+    }
+
+    if (count == 0) {
+        mymcasp_hw_deinit(handler);
+        mutex_unlock(&handler->lock);
+        return 0;
+    }
+
+    while (written < count) {
+        if (cb_push(&handler->tx_buf, (uint8_t)buf[written]) != 0)
+            break;
+        written++;
+    }
+
+    if (written == 0) {
+        mymcasp_hw_deinit(handler);
+        mutex_unlock(&handler->lock);
+        return -ENOSPC;
+    }
+
+    // Habilito la interrupcion del Tx
+    reg_val = ioread32(handler->instance + MCASP_XINTCTL_REG);
+    reg_val |= MCASP_INT_DATA;
+    iowrite32(reg_val, handler->instance + MCASP_XINTCTL_REG);
+
+    mymcasp_hw_deinit(handler);
+    mutex_unlock(&handler->lock);
+    return written;
+}
+
+static BIN_ATTR_WO(transmitir, 0);
+
+// Defino atributos
+
+static struct attribute *mymcasp_attrs[] = {
+    &dev_attr_master.attr,
+    NULL,
+};
+
+static struct bin_attribute *mymcasp_bin_attrs[] = {
+    &bin_attr_recibir,
+    &bin_attr_transmitir,
+    NULL,
+};
+
+// Agrupo todos en un mismo grupo para facilitar su manejo
+
+static const struct attribute_group mymcasp_attr_group = {
+    .attrs = mymcasp_attrs,
+    .bin_attrs = mymcasp_bin_attrs,
+};
+
+
+/////////////////////////
+// FileOperations
+/////////////////////////
+
+
+static int mymcasp_open(struct inode *inode, struct file *file) {
+    int status;
+    
+    mymcasp_handler_t *handler = container_of(inode->i_cdev, mymcasp_handler_t, mymcasp_cstm_cdev.mymcasp_cdev);
+
+    // Exclusión mutua: si el dispositivo ya está abierto por otro proceso, retornar -EBUSY
+    if (!mutex_trylock(&handler->lock)) {
+        pr_warn("%s Dispositivo en uso\n", __MODULE_NAME__);
+        return -EBUSY;
+    }
+
+    status = mymcasp_hw_init(handler);
+    if (status) {
+        mutex_unlock(&handler->lock);
+        return status;
+    }
+
+    // TODO: REMOVER -- (Hardcodeo que arranque en master para prueba de loopback sin depender de sysfs)
+    set_i2s_mode(handler, MASTER);
+
+    file->private_data = handler;
+
+    pr_info("%s Dispositivo Abierto\n", __MODULE_NAME__);
+    return 0;
+}
+
+static int mymcasp_close(struct inode *inode, struct file *file) {
+    mymcasp_handler_t *handler = file->private_data;
 
     if (handler) {
-        // Detener transferencias y apagar el reloj del periférico
-        if (handler->clk_enabled) {
-            // Deshabilitar interrupciones de TX y RX, vaciar los buffers de 32 bits de hardware RX (RBUF1) y TX (XBUF0) y limpiar estados
-            if (handler->instance) {
-                iowrite32(0, handler->instance + MCASP_XINTCTL_REG);
-                iowrite32(0, handler->instance + MCASP_RINTCTL_REG);
-                (void)MCASP_READ_RX_BUF(handler);
-                iowrite32(0, handler->instance + MCASP_XBUF0_REG);
-                iowrite32(0xFFFF, handler->instance + MCASP_RSTAT_REG);
-                iowrite32(0xFFFF, handler->instance + MCASP_XSTAT_REG);
-            }
-
-            mcasp_reg_config(handler, false);
-            if (handler->fck) {
-                clk_disable_unprepare(handler->fck);
-            }
-            handler->clk_enabled = false;
-        }
-        cb_reset(&handler->tx_buf);
-        cb_reset(&handler->rx_buf);
+        mymcasp_hw_deinit(handler);
         mutex_unlock(&handler->lock);
     }
 
     file->private_data = NULL;
-    pr_info("%s Device closed\n", __MODULE_NAME__);
+    pr_info("%s Dispositivo Abierto\n", __MODULE_NAME__);
     return 0;
 }
 
-static ssize_t cinp_read(struct file *file, char __user *buf, size_t len, loff_t *offset) {
-    cinp_handler_t *dev = file->private_data;
+static ssize_t mymcasp_read(struct file *file, char __user *buf, size_t len, loff_t *offset) {
+    mymcasp_handler_t *dev = file->private_data;
     ssize_t ret = 0;
     size_t read_bytes = 0;
     uint8_t *kbuff;
     uint8_t byte;
 
-    pr_info("%s Device read\n", __MODULE_NAME__);
+    pr_info("%s Lectura de dispositivo\n", __MODULE_NAME__);
 
     if (len == 0)
         return 0;
@@ -635,7 +811,7 @@ static ssize_t cinp_read(struct file *file, char __user *buf, size_t len, loff_t
 
     kbuff = kmalloc(len, GFP_KERNEL);
     if (kbuff == NULL) {
-        pr_err("%s Failed to allocate memory\n", __MODULE_NAME__);
+        pr_err("%s Fallo en Kmalloc\n", __MODULE_NAME__);
         return -ENOMEM;
     }
 
@@ -656,9 +832,8 @@ static ssize_t cinp_read(struct file *file, char __user *buf, size_t len, loff_t
 }
 
 
-
-static ssize_t cinp_write(struct file *file, const char __user *buf, size_t len, loff_t *offset) {
-    cinp_handler_t *dev = file->private_data;
+static ssize_t mymcasp_write(struct file *file, const char __user *buf, size_t len, loff_t *offset) {
+    mymcasp_handler_t *dev = file->private_data;
     size_t written = 0;
     uint8_t *kbuff;
 
@@ -670,7 +845,7 @@ static ssize_t cinp_write(struct file *file, const char __user *buf, size_t len,
 
     kbuff = kmalloc(len, GFP_KERNEL);
     if (kbuff == NULL) {
-        pr_err("%s Failed to allocate memory\n", __MODULE_NAME__);
+        pr_err("%s Fallo en kmalloc\n", __MODULE_NAME__);
         return -ENOMEM;
     }
 
@@ -695,23 +870,20 @@ static ssize_t cinp_write(struct file *file, const char __user *buf, size_t len,
         iowrite32(reg_val, dev->instance + MCASP_XINTCTL_REG);
     }
 
-    pr_info("%s Device write (%zu bytes)\n", __MODULE_NAME__, written);
+    pr_info("%s Escritura en el dispositivo (%zu bytes)\n", __MODULE_NAME__, written);
 
     return written;
 }
 
-
-// Este es el puente que tenemos entre el driver nuestro y el kernel cuando hace los llamados que requiere el user
-static struct file_operations cinp_fops = {
+static struct file_operations mymcasp_fops = {
     .owner = THIS_MODULE,
-    .read = cinp_read,
-    .write = cinp_write,
-    .open = cinp_open,
-    .release = cinp_close,
+    .read = mymcasp_read,
+    .write = mymcasp_write,
+    .open = mymcasp_open,
+    .release = mymcasp_close,
 };
 
-static char *cinp_devnode(const struct device *dev, umode_t *mode) {
-    // Esto se usa si queremos usar el /dev, como lo hacemos solo en el /sys no es necesario.
+static char *mymcasp_devnode(const struct device *dev, umode_t *mode) {
     if (mode) {
         *mode = 0666; // Permisos de lectura y escritura para todos
     }
@@ -719,60 +891,66 @@ static char *cinp_devnode(const struct device *dev, umode_t *mode) {
 }
 
 
-static int cinp_probe(struct platform_device *pdev)
+/////////////////////////
+// Funciones de descubrimiento de HW
+/////////////////////////
+
+// TODO Revisar bien es un quilombo
+static int mymcasp_probe(struct platform_device *pdev)
 {
     int status;
-    cinp_handler_t *cinp_resource;
+    mymcasp_handler_t *mymcasp_resource;
     struct resource *res;
 
     pr_info("%s Probing device\n", __MODULE_NAME__);
 
     
     // Reservar memoria para la estructura privada.
-    cinp_resource = devm_kzalloc(&pdev->dev, sizeof(*cinp_resource), GFP_KERNEL);
-    if (!cinp_resource)
+    mymcasp_resource = devm_kzalloc(&pdev->dev, sizeof(*mymcasp_resource), GFP_KERNEL);
+    if (!mymcasp_resource)
         return -ENOMEM;
 
-    cinp_resource->pdev = pdev;
-    cb_init(&cinp_resource->tx_buf);
-    cb_init(&cinp_resource->rx_buf);
-    cinp_resource->clk_enabled = false;
-    mutex_init(&cinp_resource->lock);
+    mymcasp_resource->pdev = pdev;
+    cb_init(&mymcasp_resource->tx_buf);
+    cb_init(&mymcasp_resource->rx_buf);
+    mymcasp_resource->clk_enabled = false;
+    mymcasp_resource->i2s_mode = NOT_INIT;
+    mutex_init(&mymcasp_resource->lock);
     
     // OBTENER RECURSOS
     res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
     if (!res) {
-        dev_err(&pdev->dev, "No se encontró el recurso de memoria en el DT\n");
+        pr_err("No se encontró el recurso de memoria en el DT\n");
         return -ENODEV; // Abortar si no hay memoria
     }
 
     // MAPEAR MEMORIA
-    cinp_resource->instance = devm_ioremap_resource(&(pdev->dev), res);
-    if (IS_ERR(cinp_resource->instance)) {
+    mymcasp_resource->instance = devm_ioremap_resource(&(pdev->dev), res);
+    if (IS_ERR(mymcasp_resource->instance)) {
         pr_err("%s:Error mapping resources\n", __MODULE_NAME__);     
-        return PTR_ERR(cinp_resource->instance);
+        return PTR_ERR(mymcasp_resource->instance);
     }
     
     if (pdev->dev.of_node) {
-        status = of_property_read_u32(pdev->dev.of_node, "utn,frecuencia", &cinp_resource->hertz);
-        // cinp_resource->hertz = 10000; // TODO BORRAR
-        if (status < 0) cinp_resource->hertz = 1000;
+        status = of_property_read_u32(pdev->dev.of_node, "utn,frecuencia", &mymcasp_resource->hertz);
+        // mymcasp_resource->hertz = 10000; // TODO BORRAR
+        if (status < 0) mymcasp_resource->hertz = 1000;
         
-        status = of_property_read_u32(pdev->dev.of_node, "square_on", &cinp_resource->square_on);
-        if (status < 0) cinp_resource->square_on = 0;
+        status = of_property_read_u32(pdev->dev.of_node, "square_on", &mymcasp_resource->square_on);
+        if (status < 0) mymcasp_resource->square_on = 0;
     } else {
-        cinp_resource->hertz = 1000;
-        cinp_resource->square_on = 0;
+        mymcasp_resource->hertz = 1000;
+        mymcasp_resource->square_on = 0;
     }
 
     // Inicializar el character device.
-    cdev_init(&cinp_resource->cinp_cstm_cdev.cinp_cdev,&cinp_fops);
+    cdev_init(&mymcasp_resource->mymcasp_cstm_cdev.mymcasp_cdev,&mymcasp_fops);
 
-    cinp_resource->cinp_cstm_cdev.cinp_cdev.owner = THIS_MODULE;
+    mymcasp_resource->mymcasp_cstm_cdev.mymcasp_cdev.owner = THIS_MODULE;
 
     // Reservar el número de dispositivo.
     status = alloc_chrdev_region(
-        &cinp_resource->cinp_cstm_cdev.cinp_dev,
+        &mymcasp_resource->mymcasp_cstm_cdev.mymcasp_dev,
         CDEV_MINORBASE,
         CDEV_NBR,
         __MODULE_NAME__
@@ -786,8 +964,8 @@ static int cinp_probe(struct platform_device *pdev)
 
     // Registrar el character device.
     status = cdev_add(
-        &cinp_resource->cinp_cstm_cdev.cinp_cdev,
-        cinp_resource->cinp_cstm_cdev.cinp_dev,
+        &mymcasp_resource->mymcasp_cstm_cdev.mymcasp_cdev,
+        mymcasp_resource->mymcasp_cstm_cdev.mymcasp_dev,
         CDEV_NBR
     );
 
@@ -796,7 +974,7 @@ static int cinp_probe(struct platform_device *pdev)
                __MODULE_NAME__, status);
 
         unregister_chrdev_region(
-            cinp_resource->cinp_cstm_cdev.cinp_dev,
+            mymcasp_resource->mymcasp_cstm_cdev.mymcasp_dev,
             CDEV_NBR
         );
 
@@ -804,26 +982,26 @@ static int cinp_probe(struct platform_device *pdev)
     }
 
     // Crear el device asociado a nuestra clase.
-    cinp_resource->cinp_device = device_create(
-        cinp_class,
+    mymcasp_resource->mymcasp_device = device_create(
+        mymcasp_class,
         &pdev->dev,
-        cinp_resource->cinp_cstm_cdev.cinp_dev,
+        mymcasp_resource->mymcasp_cstm_cdev.mymcasp_dev,
         NULL,
-        "cinp"
+        "mymcasp"
     );
 
-    if (IS_ERR(cinp_resource->cinp_device)) {
-        status = PTR_ERR(cinp_resource->cinp_device);
+    if (IS_ERR(mymcasp_resource->mymcasp_device)) {
+        status = PTR_ERR(mymcasp_resource->mymcasp_device);
 
         pr_err("%s Failed to create device: %d\n",
                __MODULE_NAME__, status);
 
-        cinp_resource->cinp_device = NULL;
+        mymcasp_resource->mymcasp_device = NULL;
 
-        cdev_del(&cinp_resource->cinp_cstm_cdev.cinp_cdev);
+        cdev_del(&mymcasp_resource->mymcasp_cstm_cdev.mymcasp_cdev);
 
         unregister_chrdev_region(
-            cinp_resource->cinp_cstm_cdev.cinp_dev,
+            mymcasp_resource->mymcasp_cstm_cdev.mymcasp_dev,
             CDEV_NBR
         );
 
@@ -832,69 +1010,29 @@ static int cinp_probe(struct platform_device *pdev)
 
     // Asociar los datos privados al dispositivo de plataforma.
     // Los callbacks de sysfs necesitan recuperarlos.
-    platform_set_drvdata(pdev, cinp_resource);
+    platform_set_drvdata(pdev, mymcasp_resource);
 
-    // Crear el atributo de lectura.
-    status = device_create_file(&pdev->dev, &dev_attr_lectura);
-
+    // Crear los atributos de sysfs.
+    status = sysfs_create_group(&pdev->dev.kobj, &mymcasp_attr_group);
     if (status < 0) {
-        pr_err("%s Failed to create lectura attribute: %d\n",__MODULE_NAME__, status);
-
+        pr_err("%s Failed to create sysfs attributes: %d\n", __MODULE_NAME__, status);
         platform_set_drvdata(pdev, NULL);
-
-        device_destroy(cinp_class,cinp_resource->cinp_cstm_cdev.cinp_dev);
-
-        cinp_resource->cinp_device = NULL;
-
-        cdev_del(&cinp_resource->cinp_cstm_cdev.cinp_cdev);
-
-        unregister_chrdev_region(
-            cinp_resource->cinp_cstm_cdev.cinp_dev,
-            CDEV_NBR
-        );
-
-        return status;
-    }
-
-    // Crear el atributo de escritura.
-    status = device_create_file(&pdev->dev, &dev_attr_escritura);
-
-    if (status < 0) {
-        pr_err("%s Failed to create escritura attribute: %d\n",
-               __MODULE_NAME__, status);
-
-        // lectura se creó correctamente; escritura no.
-        device_remove_file(&pdev->dev, &dev_attr_lectura);
-
-        platform_set_drvdata(pdev, NULL);
-
-        device_destroy(
-            cinp_class,
-            cinp_resource->cinp_cstm_cdev.cinp_dev
-        );
-
-        cinp_resource->cinp_device = NULL;
-
-        cdev_del(&cinp_resource->cinp_cstm_cdev.cinp_cdev);
-
-        unregister_chrdev_region(
-            cinp_resource->cinp_cstm_cdev.cinp_dev,
-            CDEV_NBR
-        );
-
+        device_destroy(mymcasp_class, mymcasp_resource->mymcasp_cstm_cdev.mymcasp_dev);
+        mymcasp_resource->mymcasp_device = NULL;
+        cdev_del(&mymcasp_resource->mymcasp_cstm_cdev.mymcasp_cdev);
+        unregister_chrdev_region(mymcasp_resource->mymcasp_cstm_cdev.mymcasp_dev, CDEV_NBR);
         return status;
     }
 
     // Registrar la interrupción de TX del McASP
-    status = Init_IRQ(cinp_resource);
+    status = init_irq(mymcasp_resource);
     if (status < 0) {
-        device_remove_file(&pdev->dev, &dev_attr_escritura);
-        device_remove_file(&pdev->dev, &dev_attr_lectura);
+        sysfs_remove_group(&pdev->dev.kobj, &mymcasp_attr_group);
         platform_set_drvdata(pdev, NULL);
-        device_destroy(cinp_class, cinp_resource->cinp_cstm_cdev.cinp_dev);
-        cinp_resource->cinp_device = NULL;
-        cdev_del(&cinp_resource->cinp_cstm_cdev.cinp_cdev);
-        unregister_chrdev_region(cinp_resource->cinp_cstm_cdev.cinp_dev, CDEV_NBR);
+        device_destroy(mymcasp_class, mymcasp_resource->mymcasp_cstm_cdev.mymcasp_dev);
+        mymcasp_resource->mymcasp_device = NULL;
+        cdev_del(&mymcasp_resource->mymcasp_cstm_cdev.mymcasp_cdev);
+        unregister_chrdev_region(mymcasp_resource->mymcasp_cstm_cdev.mymcasp_dev, CDEV_NBR);
         return status;
     }
 
@@ -902,54 +1040,45 @@ static int cinp_probe(struct platform_device *pdev)
 
     pr_info("%s Major: %d, Minor: %d\n",
             __MODULE_NAME__,
-            MAJOR(cinp_resource->cinp_cstm_cdev.cinp_dev),
-            MINOR(cinp_resource->cinp_cstm_cdev.cinp_dev));
+            MAJOR(mymcasp_resource->mymcasp_cstm_cdev.mymcasp_dev),
+            MINOR(mymcasp_resource->mymcasp_cstm_cdev.mymcasp_dev));
     
     return 0;
 }
-static void cinp_remove(struct platform_device *pdev)
-{
-    cinp_handler_t *cinp_resource = platform_get_drvdata(pdev);
 
-    if (!cinp_resource) {
+
+static void mymcasp_remove(struct platform_device *pdev)
+{
+    mymcasp_handler_t *mymcasp_resource = platform_get_drvdata(pdev);
+
+    if (!mymcasp_resource) {
         pr_warn("%s No se encontraron los datos del device\n",__MODULE_NAME__);
         return;
     }
 
     // Si quedó abierto/encendido, detener hardware y apagar el reloj
-    if (cinp_resource->clk_enabled) {
-        if (cinp_resource->instance) {
-            iowrite32(0, cinp_resource->instance + MCASP_XINTCTL_REG);
-            iowrite32(0, cinp_resource->instance + MCASP_RINTCTL_REG);
-        }
-        mcasp_reg_config(cinp_resource, false);
-        if (cinp_resource->fck) {
-            clk_disable_unprepare(cinp_resource->fck);
-        }
-        cinp_resource->clk_enabled = false;
-    }
+    mymcasp_hw_deinit(mymcasp_resource);
 
     // Liberar el mutex si quedó tomado por un cierre pendiente
-    if (mutex_is_locked(&cinp_resource->lock)) {
-        mutex_unlock(&cinp_resource->lock);
+    if (mutex_is_locked(&mymcasp_resource->lock)) {
+        mutex_unlock(&mymcasp_resource->lock);
     }
-    mutex_destroy(&cinp_resource->lock);
+    mutex_destroy(&mymcasp_resource->lock);
 
     // Eliminar los atributos de sysfs.
-    device_remove_file(&pdev->dev, &dev_attr_escritura);
-    device_remove_file(&pdev->dev, &dev_attr_lectura);
+    sysfs_remove_group(&pdev->dev.kobj, &mymcasp_attr_group);
 
     
     // Destruir el dispositivo asociado a la clase.
-    device_destroy(cinp_class, cinp_resource->cinp_cstm_cdev.cinp_dev);
+    device_destroy(mymcasp_class, mymcasp_resource->mymcasp_cstm_cdev.mymcasp_dev);
 
-    cinp_resource->cinp_device = NULL;
+    mymcasp_resource->mymcasp_device = NULL;
 
     // Desregistrar el character device.
-    cdev_del(&cinp_resource->cinp_cstm_cdev.cinp_cdev);
+    cdev_del(&mymcasp_resource->mymcasp_cstm_cdev.mymcasp_cdev);
 
     // Liberar los números de dispositivo.
-    unregister_chrdev_region(cinp_resource->cinp_cstm_cdev.cinp_dev, CDEV_NBR);
+    unregister_chrdev_region(mymcasp_resource->mymcasp_cstm_cdev.mymcasp_dev, CDEV_NBR);
 
     // Eliminar la asociación con los datos privados.
     platform_set_drvdata(pdev, NULL);
@@ -958,71 +1087,70 @@ static void cinp_remove(struct platform_device *pdev)
 }
 
 // nombre que aparece en DT.
-static const struct of_device_id cinp_of_match[] = {
+static const struct of_device_id mymcasp_of_match[] = {
     { .compatible = "utn,cin-device", },
     { },
 };
+
 // Se declara la tabla para que udev pueda cargar el driver automáticamente
-MODULE_DEVICE_TABLE(of, cinp_of_match); 
+MODULE_DEVICE_TABLE(of, mymcasp_of_match); 
 
 // Esta es la estructura que define a mi platform driver.
-static struct platform_driver cinp_driver = {
-    .probe = cinp_probe,
-    .remove = cinp_remove,
+static struct platform_driver mymcasp_driver = {
+    .probe = mymcasp_probe,
+    .remove = mymcasp_remove,
     .driver = {
         .name = "cin_platform_driver",
         .owner = THIS_MODULE,
-        .of_match_table = of_match_ptr(cinp_of_match),  
+        .of_match_table = of_match_ptr(mymcasp_of_match),  
     },
 };
 
 
-static int __init cinp_init(void)
-{
+static int __init mymcasp_init(void){
     int status;
 
     pr_info("%s Registering module\n", __MODULE_NAME__);
 
     // Crear la clase.
-    cinp_class = class_create("cinp_class");
+    mymcasp_class = class_create("mymcasp_class");
 
-    if (IS_ERR(cinp_class)) {
-        status = PTR_ERR(cinp_class);
-        cinp_class = NULL;
+    if (IS_ERR(mymcasp_class)) {
+        status = PTR_ERR(mymcasp_class);
+        mymcasp_class = NULL;
         pr_err("%s Failed to create class: %d\n", __MODULE_NAME__, status);
         return status;
     }
 
     // Configurar los permisos iniciales de los nodos.
-    cinp_class->devnode = cinp_devnode;
+    mymcasp_class->devnode = mymcasp_devnode;
 
     // Registrar el driver de plataforma.
-    status = platform_driver_register(&cinp_driver);
+    status = platform_driver_register(&mymcasp_driver);
 
 
     if (status < 0) {
-        pr_err("%s Failed to register platform driver: %d\n",__MODULE_NAME__, status);
-        class_destroy(cinp_class);
-        cinp_class = NULL;
+        pr_err("%s Fallo el registro del platform driver: %d\n",__MODULE_NAME__, status);
+        class_destroy(mymcasp_class);
+        mymcasp_class = NULL;
         return status;
     }
 
     return 0;
 }
-static void __exit cinp_exit(void)
-{
-    // Desregistrar el driver.
+
+static void __exit mymcasp_exit(void){
     // Esto provoca remove() para las instancias que sigan asociadas.
-    platform_driver_unregister(&cinp_driver);
+    platform_driver_unregister(&mymcasp_driver);
 
     // Destruir la clase cuando ya no quedan dispositivos asociados.
-    if (cinp_class) {
-        class_destroy(cinp_class);
-        cinp_class = NULL;
+    if (mymcasp_class) {
+        class_destroy(mymcasp_class);
+        mymcasp_class = NULL;
     }
 
-    pr_info("%s Module unregistered\n", __MODULE_NAME__);
+    pr_info("%s Modulo sin registrar\n", __MODULE_NAME__);
 }
 
-module_init(cinp_init);
-module_exit(cinp_exit);
+module_init(mymcasp_init);
+module_exit(mymcasp_exit);

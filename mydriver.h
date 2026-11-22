@@ -16,6 +16,7 @@
 #include <linux/io.h>
 #include <linux/mutex.h>
 #include <linux/interrupt.h>
+#include <linux/string.h>
 #include "utils.h"
 
 #define CDEV_NBR 1
@@ -54,22 +55,23 @@
 
 #define XTAL_FREQ 24000000
 
-#define SLAVE  0
-#define MASTER 1
+#define SLAVE    0
+#define MASTER   1
+#define NOT_INIT 2
 
 
 // Estructura que contiene los datos del device.
 typedef struct {
-    dev_t cinp_dev;
-    struct cdev cinp_cdev;
+    dev_t mymcasp_dev;
+    struct cdev mymcasp_cdev;
 } chardev_t;
 
 // Estructura unificada para manejar la data privada del dispositivo
 typedef struct {
     
-    struct device *cinp_device;
+    struct device *mymcasp_device;
     struct platform_device *pdev;
-    chardev_t cinp_cstm_cdev;
+    chardev_t mymcasp_cstm_cdev;
 
     // Buffers circulares de Tx y Rx
     circ_buf_t tx_buf;
@@ -90,6 +92,7 @@ typedef struct {
     // Parametros de I2S
     uint32_t hertz;
     uint32_t square_on;
-} cinp_handler_t;
+    uint8_t i2s_mode; /* NOT_INIT (2), SLAVE (0) o MASTER (1) */
+} mymcasp_handler_t;
 
 #endif /* _CIN_DRIVER_H_ */

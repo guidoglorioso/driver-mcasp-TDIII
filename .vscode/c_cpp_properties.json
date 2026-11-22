@@ -4,12 +4,12 @@
       "name": "Linux-ARM-Kernel",
       "includePath": [
         "${workspaceFolder}/**",
-        "/home/guido/bbb-kernel-headers/include",
-        "/home/guido/bbb-kernel-headers/include/uapi",
-        "/home/guido/bbb-kernel-headers/arch/arm/include",
-        "/home/guido/bbb-kernel-headers/arch/arm/include/uapi",
-        "/home/guido/bbb-kernel-headers/arch/arm/include/generated",
-        "/home/guido/bbb-kernel-headers/arch/arm/include/generated/uapi"
+        "/home/guidog/bbb-kernel-headers/include",
+        "/home/guidog/bbb-kernel-headers/include/uapi",
+        "/home/guidog/bbb-kernel-headers/arch/arm/include",
+        "/home/guidog/bbb-kernel-headers/arch/arm/include/uapi",
+        "/home/guidog/bbb-kernel-headers/arch/arm/include/generated",
+        "/home/guidog/bbb-kernel-headers/arch/arm/include/generated/uapi"
       ],
       "defines": [
         "__KERNEL__",
