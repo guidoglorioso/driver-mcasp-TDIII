@@ -5,7 +5,7 @@
 #include <linux/spinlock.h>
 #include <linux/errno.h>
 
-#define BUFF_SIZE 4096
+#define BUFF_SIZE 16384
 
 typedef struct {
     uint8_t buffer[BUFF_SIZE];
@@ -18,6 +18,7 @@ void cb_init(circ_buf_t *cb);
 void cb_reset(circ_buf_t *cb);
 bool cb_is_empty(circ_buf_t *cb);
 bool cb_is_full(circ_buf_t *cb);
+size_t cb_count(circ_buf_t *cb);
 int cb_push(circ_buf_t *cb, uint8_t data);
 int cb_pop(circ_buf_t *cb, uint8_t *data);
 

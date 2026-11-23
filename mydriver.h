@@ -58,7 +58,6 @@
 
 #define SLAVE    0
 #define MASTER   1
-#define NOT_INIT 2
 
 
 // Estructura que contiene los datos del device.
@@ -97,7 +96,7 @@ typedef struct {
     // Parametros de I2S
     uint32_t hertz;
     uint32_t square_on;
-    uint8_t i2s_mode; /* NOT_INIT (2), SLAVE (0) o MASTER (1) */
+    uint8_t i2s_mode; /* SLAVE (0) o MASTER (1) */
 } mymcasp_handler_t;
 
 #endif /* _CIN_DRIVER_H_ */

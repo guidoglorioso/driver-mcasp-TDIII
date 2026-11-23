@@ -49,6 +49,20 @@ bool cb_is_full(circ_buf_t *cb) {
     return full;
 }
 
+size_t cb_count(circ_buf_t *cb) {
+    unsigned long flags;
+    size_t count;
+
+    if (!cb)
+        return 0;
+
+    spin_lock_irqsave(&cb->lock, flags);
+    count = (cb->head - cb->tail + BUFF_SIZE) % BUFF_SIZE;
+    spin_unlock_irqrestore(&cb->lock, flags);
+
+    return count;
+}
+
 int cb_push(circ_buf_t *cb, uint8_t data) {
     unsigned long flags;
     size_t next_head;

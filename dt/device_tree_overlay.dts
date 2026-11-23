@@ -18,7 +18,7 @@
 };
 
 &mcasp0 {
-    compatible = "utn,cin-device";
+    compatible = "utn,mcasp-device";
     status = "okay";
 
     /* Le indico al McASP que use los pines de arriba */
