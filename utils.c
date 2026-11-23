@@ -21,6 +21,34 @@ void cb_reset(circ_buf_t *cb) {
     spin_unlock_irqrestore(&cb->lock, flags);
 }
 
+bool cb_is_empty(circ_buf_t *cb) {
+    unsigned long flags;
+    bool empty;
+
+    if (!cb)
+        return true;
+
+    spin_lock_irqsave(&cb->lock, flags);
+    empty = (cb->head == cb->tail);
+    spin_unlock_irqrestore(&cb->lock, flags);
+
+    return empty;
+}
+
+bool cb_is_full(circ_buf_t *cb) {
+    unsigned long flags;
+    bool full;
+
+    if (!cb)
+        return true;
+
+    spin_lock_irqsave(&cb->lock, flags);
+    full = (((cb->head + 1) % BUFF_SIZE) == cb->tail);
+    spin_unlock_irqrestore(&cb->lock, flags);
+
+    return full;
+}
+
 int cb_push(circ_buf_t *cb, uint8_t data) {
     unsigned long flags;
     size_t next_head;

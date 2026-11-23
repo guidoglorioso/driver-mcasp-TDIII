@@ -17,6 +17,7 @@
 #include <linux/mutex.h>
 #include <linux/interrupt.h>
 #include <linux/string.h>
+#include <linux/wait.h>
 #include "utils.h"
 
 #define CDEV_NBR 1
@@ -76,6 +77,10 @@ typedef struct {
     // Buffers circulares de Tx y Rx
     circ_buf_t tx_buf;
     circ_buf_t rx_buf;
+
+    // Colas de espera (TASK_INTERRUPTIBLE) para Tx y Rx
+    wait_queue_head_t tx_wq;
+    wait_queue_head_t rx_wq;
 
     // Memoria de I2s y Clk
     void __iomem *instance;

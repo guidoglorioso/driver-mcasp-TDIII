@@ -4,9 +4,9 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Guido Glorioso");
 MODULE_DESCRIPTION("Driver de MCASP TDIII");
 
-static const char __MODULE_NAME__[] = "mymcasp"; 
+static const char __MODULE_NAME__[] = "td3_i2s";
 
-static struct class *mymcasp_class; // Necesario para crear el nodo en /dev
+static mymcasp_handler_t *g_handler = NULL;
 
 /////////////////////////
 // configuracion de HW
@@ -101,6 +101,7 @@ static irqreturn_t isr_tx_mcasp(int irq, void *dev_id) {
         iowrite32(word, handler->instance + MCASP_XBUF0_REG);
     }
 
+    wake_up_interruptible(&handler->tx_wq);
     return IRQ_HANDLED;
 }
 // TODO Revisar registros, hacer clean
@@ -121,6 +122,8 @@ static irqreturn_t isr_rx_mcasp(int irq, void *dev_id) {
         cb_push(&handler->rx_buf, (uint8_t)((word >> 16) & 0xFF));
         cb_push(&handler->rx_buf, (uint8_t)((word >> 8)  & 0xFF));
         cb_push(&handler->rx_buf, (uint8_t)((word >> 0)  & 0xFF));
+
+        wake_up_interruptible(&handler->rx_wq);
     }
 
     // Limpiar flags de error/estado adicionales en RSTAT si los hubiera
@@ -571,11 +574,11 @@ static int mymcasp_hw_init(mymcasp_handler_t *handler) {
 
 
 /////////////////////////
-// Interfaz Sysfs - (/sys/class/td3_i2s/) 
+// Interfaz Sysfs - (/sys/class/td3_i2s/)
 /////////////////////////
 
-static ssize_t master_show(struct device *dev, struct device_attribute *attr, char *buf) {
-    mymcasp_handler_t *handler = dev_get_drvdata(dev);
+static ssize_t master_show(const struct class *cls, const struct class_attribute *attr, char *buf) {
+    mymcasp_handler_t *handler = g_handler;
     ssize_t ret;
 
     if (!handler || !handler->instance)
@@ -593,8 +596,8 @@ static ssize_t master_show(struct device *dev, struct device_attribute *attr, ch
     return ret;
 }
 
-static ssize_t master_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count) {
-    mymcasp_handler_t *handler = dev_get_drvdata(dev);
+static ssize_t master_store(const struct class *cls, const struct class_attribute *attr, const char *buf, size_t count) {
+    mymcasp_handler_t *handler = g_handler;
     char kbuf[16];
     char *arg;
     size_t len;
@@ -634,12 +637,12 @@ static ssize_t master_store(struct device *dev, struct device_attribute *attr, c
     return count;
 }
 
-static DEVICE_ATTR_RW(master);
+static CLASS_ATTR_RW(master);
 
 static ssize_t recibir_read(struct file *filp, struct kobject *kobj,
                             struct bin_attribute *attr, char *buf,
                             loff_t off, size_t count) {
-    mymcasp_handler_t *handler = dev_get_drvdata(kobj_to_dev(kobj));
+    mymcasp_handler_t *handler = g_handler;
     size_t read_bytes = 0;
     uint8_t byte;
     int ret;
@@ -679,7 +682,7 @@ static BIN_ATTR_RO(recibir, 0);
 static ssize_t transmitir_write(struct file *filp, struct kobject *kobj,
                                 struct bin_attribute *attr, char *buf,
                                 loff_t off, size_t count) {
-    mymcasp_handler_t *handler = dev_get_drvdata(kobj_to_dev(kobj));
+    mymcasp_handler_t *handler = g_handler;
     size_t written = 0;
     uint32_t reg_val;
     int ret;
@@ -726,24 +729,40 @@ static ssize_t transmitir_write(struct file *filp, struct kobject *kobj,
 
 static BIN_ATTR_WO(transmitir, 0);
 
-// Defino atributos
+// Defino atributos de la clase /sys/class/td3_i2s/
 
-static struct attribute *mymcasp_attrs[] = {
-    &dev_attr_master.attr,
+static struct attribute *td3_i2s_attrs[] = {
+    &class_attr_master.attr,
     NULL,
 };
 
-static struct bin_attribute *mymcasp_bin_attrs[] = {
+static struct bin_attribute *td3_i2s_bin_attrs[] = {
     &bin_attr_recibir,
     &bin_attr_transmitir,
     NULL,
 };
 
-// Agrupo todos en un mismo grupo para facilitar su manejo
+static const struct attribute_group td3_i2s_attr_group = {
+    .attrs = td3_i2s_attrs,
+    .bin_attrs = td3_i2s_bin_attrs,
+};
 
-static const struct attribute_group mymcasp_attr_group = {
-    .attrs = mymcasp_attrs,
-    .bin_attrs = mymcasp_bin_attrs,
+static const struct attribute_group *td3_i2s_class_groups[] = {
+    &td3_i2s_attr_group,
+    NULL,
+};
+
+static char *td3_i2s_devnode(const struct device *dev, umode_t *mode) {
+    if (mode) {
+        *mode = 0666; // Permisos de lectura y escritura para todos
+    }
+    return NULL;
+}
+
+static const struct class td3_i2s_class = {
+    .name = "td3_i2s",
+    .class_groups = td3_i2s_class_groups,
+    .devnode = td3_i2s_devnode,
 };
 
 
@@ -800,11 +819,11 @@ static ssize_t mymcasp_read(struct file *file, char __user *buf, size_t len, lof
 
     pr_info("%s Lectura de dispositivo\n", __MODULE_NAME__);
 
+    if (!dev || !dev->instance)
+        return -ENODEV;
+
     if (len == 0)
         return 0;
-        
-    if (len > BUFF_SIZE)    
-        len = BUFF_SIZE;
 
     if (len > BUFF_SIZE)
         len = BUFF_SIZE;
@@ -815,16 +834,21 @@ static ssize_t mymcasp_read(struct file *file, char __user *buf, size_t len, lof
         return -ENOMEM;
     }
 
-    while (read_bytes < len && cb_pop(&dev->rx_buf, &byte) == 0) {
-        kbuff[read_bytes++] = byte;
+    while (read_bytes == 0) {
+        if (wait_event_interruptible(dev->rx_wq, !cb_is_empty(&dev->rx_buf))) {
+            kfree(kbuff);
+            return -ERESTARTSYS;
+        }
+
+        while (read_bytes < len && cb_pop(&dev->rx_buf, &byte) == 0) {
+            kbuff[read_bytes++] = byte;
+        }
     }
 
-    if (read_bytes > 0) {
-        if (copy_to_user(buf, kbuff, read_bytes)) {
-            ret = -EFAULT;
-        } else {
-            ret = read_bytes;
-        }
+    if (copy_to_user(buf, kbuff, read_bytes)) {
+        ret = -EFAULT;
+    } else {
+        ret = read_bytes;
     }
 
     kfree(kbuff);
@@ -836,6 +860,10 @@ static ssize_t mymcasp_write(struct file *file, const char __user *buf, size_t l
     mymcasp_handler_t *dev = file->private_data;
     size_t written = 0;
     uint8_t *kbuff;
+    uint32_t reg_val;
+
+    if (!dev || !dev->instance)
+        return -ENODEV;
 
     if (len == 0)
         return 0;
@@ -854,18 +882,29 @@ static ssize_t mymcasp_write(struct file *file, const char __user *buf, size_t l
         return -EFAULT;
     }
 
-    // Enviar a al buffer de tx
+    // Enviar al buffer de tx; suspender en TASK_INTERRUPTIBLE si está lleno
     while (written < len) {
-        if (cb_push(&dev->tx_buf, kbuff[written]) != 0)
-            break;
-        written++;
+        if (cb_push(&dev->tx_buf, kbuff[written]) == 0) {
+            written++;
+            continue;
+        }
+
+        // Asegurar IRQ de TX habilitada para que isr_tx_mcasp libere espacio
+        reg_val = ioread32(dev->instance + MCASP_XINTCTL_REG);
+        reg_val |= MCASP_INT_DATA;
+        iowrite32(reg_val, dev->instance + MCASP_XINTCTL_REG);
+
+        if (wait_event_interruptible(dev->tx_wq, !cb_is_full(&dev->tx_buf))) {
+            kfree(kbuff);
+            return written > 0 ? written : -ERESTARTSYS;
+        }
     }
 
     kfree(kbuff);
 
     // Si se cargaron datos, habilitar la interrupción XDATA de TX para que isr_tx_mcasp los consuma
-    if (written > 0 && dev->instance) {
-        uint32_t reg_val = ioread32(dev->instance + MCASP_XINTCTL_REG);
+    if (written > 0) {
+        reg_val = ioread32(dev->instance + MCASP_XINTCTL_REG);
         reg_val |= MCASP_INT_DATA;
         iowrite32(reg_val, dev->instance + MCASP_XINTCTL_REG);
     }
@@ -882,13 +921,6 @@ static struct file_operations mymcasp_fops = {
     .open = mymcasp_open,
     .release = mymcasp_close,
 };
-
-static char *mymcasp_devnode(const struct device *dev, umode_t *mode) {
-    if (mode) {
-        *mode = 0666; // Permisos de lectura y escritura para todos
-    }
-    return NULL;
-}
 
 
 /////////////////////////
@@ -913,6 +945,8 @@ static int mymcasp_probe(struct platform_device *pdev)
     mymcasp_resource->pdev = pdev;
     cb_init(&mymcasp_resource->tx_buf);
     cb_init(&mymcasp_resource->rx_buf);
+    init_waitqueue_head(&mymcasp_resource->tx_wq);
+    init_waitqueue_head(&mymcasp_resource->rx_wq);
     mymcasp_resource->clk_enabled = false;
     mymcasp_resource->i2s_mode = NOT_INIT;
     mutex_init(&mymcasp_resource->lock);
@@ -981,13 +1015,14 @@ static int mymcasp_probe(struct platform_device *pdev)
         return status;
     }
 
-    // Crear el device asociado a nuestra clase.
+    // Crear el device asociado a nuestra clase (/dev/td3_i2s).
     mymcasp_resource->mymcasp_device = device_create(
-        mymcasp_class,
+        &td3_i2s_class,
         &pdev->dev,
         mymcasp_resource->mymcasp_cstm_cdev.mymcasp_dev,
-        NULL,
-        "mymcasp"
+        mymcasp_resource,
+        "%s",
+        __MODULE_NAME__
     );
 
     if (IS_ERR(mymcasp_resource->mymcasp_device)) {
@@ -1009,32 +1044,20 @@ static int mymcasp_probe(struct platform_device *pdev)
     }
 
     // Asociar los datos privados al dispositivo de plataforma.
-    // Los callbacks de sysfs necesitan recuperarlos.
     platform_set_drvdata(pdev, mymcasp_resource);
 
-    // Crear los atributos de sysfs.
-    status = sysfs_create_group(&pdev->dev.kobj, &mymcasp_attr_group);
+    // Registrar las interrupciones de TX y RX del McASP
+    status = init_irq(mymcasp_resource);
     if (status < 0) {
-        pr_err("%s Failed to create sysfs attributes: %d\n", __MODULE_NAME__, status);
         platform_set_drvdata(pdev, NULL);
-        device_destroy(mymcasp_class, mymcasp_resource->mymcasp_cstm_cdev.mymcasp_dev);
+        device_destroy(&td3_i2s_class, mymcasp_resource->mymcasp_cstm_cdev.mymcasp_dev);
         mymcasp_resource->mymcasp_device = NULL;
         cdev_del(&mymcasp_resource->mymcasp_cstm_cdev.mymcasp_cdev);
         unregister_chrdev_region(mymcasp_resource->mymcasp_cstm_cdev.mymcasp_dev, CDEV_NBR);
         return status;
     }
 
-    // Registrar la interrupción de TX del McASP
-    status = init_irq(mymcasp_resource);
-    if (status < 0) {
-        sysfs_remove_group(&pdev->dev.kobj, &mymcasp_attr_group);
-        platform_set_drvdata(pdev, NULL);
-        device_destroy(mymcasp_class, mymcasp_resource->mymcasp_cstm_cdev.mymcasp_dev);
-        mymcasp_resource->mymcasp_device = NULL;
-        cdev_del(&mymcasp_resource->mymcasp_cstm_cdev.mymcasp_cdev);
-        unregister_chrdev_region(mymcasp_resource->mymcasp_cstm_cdev.mymcasp_dev, CDEV_NBR);
-        return status;
-    }
+    g_handler = mymcasp_resource;
 
     pr_info("%s Device registered successfully\n", __MODULE_NAME__);
 
@@ -1056,6 +1079,8 @@ static void mymcasp_remove(struct platform_device *pdev)
         return;
     }
 
+    g_handler = NULL;
+
     // Si quedó abierto/encendido, detener hardware y apagar el reloj
     mymcasp_hw_deinit(mymcasp_resource);
 
@@ -1065,12 +1090,8 @@ static void mymcasp_remove(struct platform_device *pdev)
     }
     mutex_destroy(&mymcasp_resource->lock);
 
-    // Eliminar los atributos de sysfs.
-    sysfs_remove_group(&pdev->dev.kobj, &mymcasp_attr_group);
-
-    
     // Destruir el dispositivo asociado a la clase.
-    device_destroy(mymcasp_class, mymcasp_resource->mymcasp_cstm_cdev.mymcasp_dev);
+    device_destroy(&td3_i2s_class, mymcasp_resource->mymcasp_cstm_cdev.mymcasp_dev);
 
     mymcasp_resource->mymcasp_device = NULL;
 
@@ -1112,27 +1133,18 @@ static int __init mymcasp_init(void){
 
     pr_info("%s Registering module\n", __MODULE_NAME__);
 
-    // Crear la clase.
-    mymcasp_class = class_create("mymcasp_class");
-
-    if (IS_ERR(mymcasp_class)) {
-        status = PTR_ERR(mymcasp_class);
-        mymcasp_class = NULL;
-        pr_err("%s Failed to create class: %d\n", __MODULE_NAME__, status);
+    // Registrar la clase (/sys/class/td3_i2s/ con sus atributos de clase).
+    status = class_register(&td3_i2s_class);
+    if (status < 0) {
+        pr_err("%s Failed to register class: %d\n", __MODULE_NAME__, status);
         return status;
     }
 
-    // Configurar los permisos iniciales de los nodos.
-    mymcasp_class->devnode = mymcasp_devnode;
-
     // Registrar el driver de plataforma.
     status = platform_driver_register(&mymcasp_driver);
-
-
     if (status < 0) {
         pr_err("%s Fallo el registro del platform driver: %d\n",__MODULE_NAME__, status);
-        class_destroy(mymcasp_class);
-        mymcasp_class = NULL;
+        class_unregister(&td3_i2s_class);
         return status;
     }
 
@@ -1143,11 +1155,8 @@ static void __exit mymcasp_exit(void){
     // Esto provoca remove() para las instancias que sigan asociadas.
     platform_driver_unregister(&mymcasp_driver);
 
-    // Destruir la clase cuando ya no quedan dispositivos asociados.
-    if (mymcasp_class) {
-        class_destroy(mymcasp_class);
-        mymcasp_class = NULL;
-    }
+    // Desregistrar la clase cuando ya no quedan dispositivos asociados.
+    class_unregister(&td3_i2s_class);
 
     pr_info("%s Modulo sin registrar\n", __MODULE_NAME__);
 }
