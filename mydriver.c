@@ -967,7 +967,7 @@ static int mymcasp_probe(struct platform_device *pdev)
     
     if (pdev->dev.of_node) {
         status = of_property_read_u32(pdev->dev.of_node, "utn,frecuencia", &mymcasp_resource->hertz);
-        // mymcasp_resource->hertz = 10000; // TODO BORRAR
+         mymcasp_resource->hertz = 100000; // TODO BORRAR
         if (status < 0) mymcasp_resource->hertz = 1000;
         
         status = of_property_read_u32(pdev->dev.of_node, "square_on", &mymcasp_resource->square_on);
