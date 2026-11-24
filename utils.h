@@ -11,10 +11,12 @@ typedef struct {
     uint8_t buffer[BUFF_SIZE];
     size_t head;
     size_t tail;
+    size_t count;
+    bool overwrite;
     spinlock_t lock;
 } circ_buf_t;
 
-void cb_init(circ_buf_t *cb);
+void cb_init(circ_buf_t *cb, bool overwrite);
 void cb_reset(circ_buf_t *cb);
 bool cb_is_empty(circ_buf_t *cb);
 bool cb_is_full(circ_buf_t *cb);

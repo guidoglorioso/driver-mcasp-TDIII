@@ -470,7 +470,6 @@ static void mymcasp_hw_deinit(mymcasp_handler_t *handler) {
     }
 
     cb_reset(&handler->tx_buf);
-    cb_reset(&handler->rx_buf);
 }
 
 static int mymcasp_hw_init(mymcasp_handler_t *handler) {
@@ -487,9 +486,8 @@ static int mymcasp_hw_init(mymcasp_handler_t *handler) {
     if (status)
         return status;
 
-    // Resetear índices de los buffers circulares de Tx y Rx antes de habilitar el McASP
+    // Resetear índices del buffer circular de Tx antes de habilitar el McASP; Rx conserva datos previos
     cb_reset(&handler->tx_buf);
-    cb_reset(&handler->rx_buf);
 
     // Inicializa el McASP siguiendo la secuencia 22.3.12.2 (Pasos 1 a 10)
     mcasp_reg_config(handler, true);
@@ -891,8 +889,8 @@ static int mymcasp_probe(struct platform_device *pdev)
 
     // 2. Inicializar campos, buffers circulares, colas de espera y mutex.
     mymcasp_resource->pdev = pdev;
-    cb_init(&mymcasp_resource->tx_buf);
-    cb_init(&mymcasp_resource->rx_buf);
+    cb_init(&mymcasp_resource->tx_buf, false);
+    cb_init(&mymcasp_resource->rx_buf, true);
     init_waitqueue_head(&mymcasp_resource->tx_wq);
     init_waitqueue_head(&mymcasp_resource->rx_wq);
     mymcasp_resource->clk_enabled = false;
