@@ -18,6 +18,8 @@
 #include <linux/interrupt.h>
 #include <linux/string.h>
 #include <linux/wait.h>
+#include <linux/sched.h>
+#include <linux/jiffies.h>
 #include "utils.h"
 
 #define CDEV_NBR 1
