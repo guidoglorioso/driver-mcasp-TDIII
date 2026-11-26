@@ -5,7 +5,7 @@
 #include <linux/spinlock.h>
 #include <linux/errno.h>
 
-#define BUFF_SIZE 16384
+#define BUFF_SIZE 33000//32768
 
 typedef struct {
     uint8_t buffer[BUFF_SIZE];

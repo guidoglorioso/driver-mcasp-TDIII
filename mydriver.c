@@ -295,15 +295,19 @@ static void mcasp_reg_config(mymcasp_handler_t *handler, bool enable){
     uint32_t reg_val;
 
     if(!enable){
-        // Apago los clocks de TX usando XGBLCTL
-        reg_val = ioread32(handler->instance + MCASP_XGBLCTL_REG);
-        reg_val &= ~MCASP_GBL_TX_MASK;
-        iowrite32(reg_val, handler->instance + MCASP_XGBLCTL_REG);
+        int timeout = 1000;
 
-        // Apago los clocks de RX usando RGBLCTL
-        reg_val = ioread32(handler->instance + MCASP_RGBLCTL_REG);
-        reg_val &= ~MCASP_GBL_RX_MASK;
-        iowrite32(reg_val, handler->instance + MCASP_RGBLCTL_REG);
+        // Dejar AFSX y ACLKX en alta impedancia (entradas) por seguridad eléctrica
+        reg_val = ioread32(handler->instance + MCASP_PDIR_REG);
+        reg_val &= ~(MCASP_PIN_AFSX | MCASP_PIN_ACLKX);
+        iowrite32(reg_val, handler->instance + MCASP_PDIR_REG);
+
+        // Detener clocks y máquinas de estado TX/RX poniendo GBLCTL = 0 y esperar sincronización
+        iowrite32(0, handler->instance + MCASP_GBLCTL_REG);
+        while ((ioread32(handler->instance + MCASP_GBLCTL_REG) &
+                (MCASP_GBL_TX_MASK | MCASP_GBL_RX_MASK)) && --timeout > 0) {
+            udelay(1);
+        }
         return;
     }
     
@@ -491,8 +495,6 @@ static void mymcasp_tx_stop(mymcasp_handler_t *handler) {
 }
 
 static void mymcasp_hw_deinit(mymcasp_handler_t *handler) {
-    bool disable_hw = false;
-
     if (!handler)
         return;
 
@@ -502,33 +504,39 @@ static void mymcasp_hw_deinit(mymcasp_handler_t *handler) {
         handler->hw_users--;
 
     if (handler->hw_users == 0 && handler->clk_enabled) {
-        // Deshabilitar interrupciones de TX y RX, vaciar los buffers de 32 bits de hardware RX (RBUF1) y TX (XBUF0) y limpiar estados
+        // 1. Deshabilitar interrupciones de TX y RX
         if (handler->instance) {
             mcasp_irq_tx_enable(handler, false);
             mcasp_irq_rx_enable(handler, false);
-            (void)MCASP_READ_RX_BUF(handler);
-            iowrite32(0, handler->instance + MCASP_XBUF0_REG);
-            iowrite32(0xFFFF, handler->instance + MCASP_RSTAT_REG);
-            iowrite32(0xFFFF, handler->instance + MCASP_XSTAT_REG);
         }
-
-        mcasp_reg_config(handler, false);
         handler->clk_enabled = false;
-        disable_hw = true;
-    }
-    mutex_unlock(&handler->hw_lock);
 
-    if (disable_hw) {
+        // 2. Esperar a que finalice cualquier ISR en curso antes de tocar registros/clocks
         if (handler->irq_tx >= 0)
             synchronize_irq(handler->irq_tx);
         if (handler->irq_rx >= 0)
             synchronize_irq(handler->irq_rx);
 
-        if (handler->fck)
-            clk_disable_unprepare(handler->fck);
+        // 3. Poner GBLCTL = 0 y pines de reloj en entrada
+        if (handler->instance) {
+            mcasp_reg_config(handler, false);
+
+            // 4. Vaciar buffers HW, limpiar RSTAT/XSTAT y resetear buffers SW/estado TX
+            (void)MCASP_READ_RX_BUF(handler);
+            iowrite32(0, handler->instance + MCASP_XBUF0_REG);
+            iowrite32(MCASP_STAT_CLEAR_ALL, handler->instance + MCASP_RSTAT_REG);
+            iowrite32(MCASP_STAT_CLEAR_ALL, handler->instance + MCASP_XSTAT_REG);
+        }
 
         cb_reset(&handler->tx_buf);
+        cb_reset(&handler->rx_buf);
+        handler->tx_state = TX_STATE_IDLE;
+
+        // 5. Apagar el clock funcional del periférico
+        if (handler->fck)
+            clk_disable_unprepare(handler->fck);
     }
+    mutex_unlock(&handler->hw_lock);
 }
 
 static int mymcasp_hw_init(mymcasp_handler_t *handler) {
@@ -547,8 +555,10 @@ static int mymcasp_hw_init(mymcasp_handler_t *handler) {
             return status;
         }
 
-        // Resetear índices del buffer circular de Tx antes de habilitar el McASP; Rx conserva datos previos
+        // Resetear índices de los buffers circulares y estado TX antes de habilitar el McASP
         cb_reset(&handler->tx_buf);
+        cb_reset(&handler->rx_buf);
+        handler->tx_state = TX_STATE_IDLE;
 
         // Inicializa el McASP siguiendo la secuencia 22.3.12.2 (Pasos 1 a 10)
         mcasp_reg_config(handler, true);
@@ -853,8 +863,6 @@ static int mymcasp_open(struct inode *inode, struct file *file) {
     }
 
     file->private_data = handler;
-
-    pr_info("%s Dispositivo Abierto\n", __MODULE_NAME__);
     return 0;
 }
 
@@ -871,7 +879,6 @@ static int mymcasp_close(struct inode *inode, struct file *file) {
     }
 
     file->private_data = NULL;
-    pr_info("%s Dispositivo Cerrado\n", __MODULE_NAME__);
     return 0;
 }
 
@@ -880,8 +887,6 @@ static ssize_t mymcasp_read(struct file *file, char __user *buf, size_t len, lof
     size_t total_read = 0;
     uint8_t *kbuff;
     uint8_t byte;
-
-    pr_info("%s Lectura de dispositivo\n", __MODULE_NAME__);
 
     if (!dev || !dev->instance)
         return -ENODEV;
@@ -989,8 +994,6 @@ static ssize_t mymcasp_write(struct file *file, const char __user *buf, size_t l
             return total_written > 0 ? total_written : -ERESTARTSYS;
         }
     }
-
-    pr_info("%s Escritura en el dispositivo (%zu bytes)\n", __MODULE_NAME__, total_written);
 
     mutex_unlock(&dev->tx_lock);
     return total_written;
