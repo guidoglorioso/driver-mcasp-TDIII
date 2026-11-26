@@ -49,7 +49,64 @@
 #define MCASP_XBUF0_REG   0x200 /* Transmit Buffer Register for Serializer 0 (AXR0) */
 #define MCASP_RBUF1_REG   0x284 /* Receive Buffer Register for Serializer 1 (AXR1) */
 
-#define MCASP_INT_DATA    (1 << 5) /* Bit 5 de XINTCTL/XSTAT: XDATA / RDATA */
+#define MCASP_INT_DATA    (1U << 5) /* Bit 5 de XINTCTL/XSTAT: XDATA / RDATA */
+
+/* Bits de PFUNC / PDIR */
+#define MCASP_PIN_AXR0        (1U << 0)
+#define MCASP_PIN_AXR1        (1U << 1)
+#define MCASP_PIN_ACLKX       (1U << 26)
+#define MCASP_PIN_AFSX        (1U << 28)
+
+/* Bits de GBLCTL / XGBLCTL / RGBLCTL */
+#define MCASP_GBL_RCLKRST     (1U << 0)
+#define MCASP_GBL_RHCLKRST    (1U << 1)
+#define MCASP_GBL_RSRCLR      (1U << 2)
+#define MCASP_GBL_RSMRST      (1U << 3)
+#define MCASP_GBL_RFRST       (1U << 4)
+#define MCASP_GBL_RX_MASK     0x1FU
+#define MCASP_GBL_XCLKRST     (1U << 8)
+#define MCASP_GBL_XHCLKRST    (1U << 9)
+#define MCASP_GBL_XSRCLR      (1U << 10)
+#define MCASP_GBL_XSMRST      (1U << 11)
+#define MCASP_GBL_XFRST       (1U << 12)
+#define MCASP_GBL_TX_MASK     (0x1FU << 8)
+
+/* Bits de RFMT / XFMT */
+#define MCASP_FMT_DATDLY_SHIFT 16
+#define MCASP_FMT_DATDLY(n)   ((uint32_t)(n) << MCASP_FMT_DATDLY_SHIFT)
+#define MCASP_FMT_RVRS_MSB    (1U << 15)
+#define MCASP_FMT_SSZ_SHIFT   4
+#define MCASP_FMT_SSZ_32BIT   (0xFU << MCASP_FMT_SSZ_SHIFT)
+#define MCASP_FMT_BUSEL_CFG   (1U << 3)
+
+/* Bits de AFSRCTL / AFSXCTL */
+#define MCASP_AFS_MOD_SHIFT   7
+#define MCASP_AFS_MOD_MASK    (0x1FFU << MCASP_AFS_MOD_SHIFT)
+#define MCASP_AFS_MOD(slots)  ((uint32_t)(slots) << MCASP_AFS_MOD_SHIFT)
+#define MCASP_AFS_FRWID_WORD  (1U << 4)
+#define MCASP_AFS_FSXM        (1U << 1)
+
+/* Bits de ACLKRCTL / ACLKXCTL */
+#define MCASP_ACLK_CLKP       (1U << 7)
+#define MCASP_ACLKX_ASYNC     (1U << 6)
+#define MCASP_ACLKX_CLKXM     (1U << 5)
+#define MCASP_ACLKX_DIV_MASK  0x1FU
+#define MCASP_ACLKXDIV_MAX    31U
+
+/* Bits de AHCLKXCTL */
+#define MCASP_AHCLKX_HCLKXM   (1U << 15)
+#define MCASP_AHCLKX_DIV_MASK 0xFFFU
+#define MCASP_AHCLKXDIV_MAX   4095U
+
+/* Slots TDM y Serializers */
+#define MCASP_TDM_2SLOTS      0x00000003U
+#define MCASP_SRCTL_SRMOD_MASK 0x3U
+#define MCASP_SRCTL_SRMOD_TX  0x1U
+#define MCASP_SRCTL_SRMOD_RX  0x2U
+
+/* Bits de estado XSTAT / RSTAT */
+#define MCASP_XSTAT_XUNDRN    (1U << 0)
+#define MCASP_STAT_CLEAR_ALL  0xFFFFU
 
 #define MCASP_WRITE_TX_BUF(handler, word) iowrite32((uint32_t)(word), (handler)->instance + MCASP_XBUF0_REG)
 #define MCASP_READ_RX_BUF(handler)        ioread32((handler)->instance + MCASP_RBUF1_REG)
