@@ -1064,7 +1064,7 @@ static int mymcasp_probe(struct platform_device *pdev)
         mymcasp_resource->hertz = FAULT_FREQ;
     }
 #ifdef FREQ_TEST
-    mymcasp_resource->hertz = FREQ_TEST; // TODO BORRAR
+    mymcasp_resource->hertz = FREQ_TEST; 
 #endif
 
     // 5. Reservar el número de dispositivo.
