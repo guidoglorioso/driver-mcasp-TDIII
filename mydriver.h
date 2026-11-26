@@ -51,7 +51,15 @@
 #define MCASP_XBUF0_REG   0x200 /* Transmit Buffer Register for Serializer 0 (AXR0) */
 #define MCASP_RBUF1_REG   0x284 /* Receive Buffer Register for Serializer 1 (AXR1) */
 
-#define MCASP_INT_DATA    (1U << 5) /* Bit 5 de XINTCTL/XSTAT: XDATA / RDATA */
+/* Registros de control y estado del módulo AFIFO (Audio FIFO, offset sobre instance) */
+#define MCASP_WFIFOCTL_REG 0x1000 /* AFIFO: Write FIFO Control Register */
+#define MCASP_WFIFOSTS_REG 0x1004 /* AFIFO: Write FIFO Status Register */
+#define MCASP_RFIFOCTL_REG 0x1008 /* AFIFO: Read FIFO Control Register */
+#define MCASP_RFIFOSTS_REG 0x100C /* AFIFO: Read FIFO Status Register */
+
+#define MCASP_INTCTL_STAFRM (1U << 7) /* Bit 7 de XINTCTL/RINTCTL: XSTAFRM / RSTAFRM */
+#define MCASP_STAT_STAFRM   (1U << 6) /* Bit 6 de XSTAT/RSTAT: XSTAFRM / RSTAFRM */
+#define MCASP_INT_DATA      (1U << 5) /* Bit 5 de XINTCTL/XSTAT: XDATA / RDATA */
 
 /* Bits de PFUNC / PDIR */
 #define MCASP_PIN_AXR0        (1U << 0)
@@ -80,6 +88,7 @@
 #define MCASP_FMT_SSZ_SHIFT   4
 #define MCASP_FMT_SSZ_32BIT   (0xFU << MCASP_FMT_SSZ_SHIFT)
 #define MCASP_FMT_BUSEL_CFG   (1U << 3)
+#define MCASP_FMT_BUSEL_DAT   0U        /* AFIFO: BUSEL = 0 selecciona el Data Port (0x4600_0000) */
 
 /* Bits de AFSRCTL / AFSXCTL */
 #define MCASP_AFS_MOD_SHIFT   7
@@ -108,22 +117,32 @@
 
 /* Bits de estado XSTAT / RSTAT */
 #define MCASP_XSTAT_XUNDRN    (1U << 0)
+#define MCASP_RSTAT_ROVRN     (1U << 0)
 #define MCASP_STAT_CLEAR_ALL  0xFFFFU
+
+/* Bits de control y estado del módulo AFIFO (WFIFOCTL / WFIFOSTS / RFIFOCTL / RFIFOSTS) */
+#define MCASP_WFIFO_WENA         (1U << 16) /* AFIFO: Habilitación de Write FIFO */
+#define MCASP_RFIFO_RENA         (1U << 16) /* AFIFO: Habilitación de Read FIFO */
+#define MCASP_AFIFO_NUMEVT_SHIFT 8          /* AFIFO: Desplazamiento de WNUMEVT / RNUMEVT */
+#define MCASP_AFIFO_NUMEVT(n)    (((uint32_t)(n) & 0xFFU) << MCASP_AFIFO_NUMEVT_SHIFT) /* AFIFO: Umbral de evento (words) */
+#define MCASP_AFIFO_NUMDMA(n)    ((uint32_t)(n) & 0xFFU) /* AFIFO: Palabras por transferencia DMA/McASP */
+#define MCASP_AFIFO_LVL_MASK     0xFFU      /* AFIFO: Máscara de WLVL / RLVL en WFIFOSTS / RFIFOSTS */
+#define MCASP_AFIFO_DEPTH_WORDS  64U        /* AFIFO: Profundidad máxima de WFIFO/RFIFO (64 words) */
+#define MCASP_AFIFO_PRELOAD_WORDS 4U        /* AFIFO: Palabras de cero iniciales antes de soltar XSMRST */
+#define MCASP_AFIFO_NUMEVT_WORDS 16U        /* AFIFO: Umbral configurado de 16 words (TX y RX) */
+#define MCASP_AFIFO_NUMDMA_TX    1U         /* AFIFO: 1 serializer TX activo (AXR0) */
+#define MCASP_AFIFO_NUMDMA_RX    1U         /* AFIFO: 1 serializer RX activo (AXR1) */
 
 #define MCASP_WRITE_TX_BUF(handler, word) iowrite32((uint32_t)(word), (handler)->instance + MCASP_XBUF0_REG)
 #define MCASP_READ_RX_BUF(handler)        ioread32((handler)->instance + MCASP_RBUF1_REG)
+#define MCASP_WRITE_DAT(handler, word)    iowrite32((uint32_t)(word), (handler)->dat_port) /* AFIFO: Escritura al Data Port */
+#define MCASP_READ_DAT(handler)           ioread32((handler)->dat_port)                   /* AFIFO: Lectura desde el Data Port */
 
 #define XTAL_FREQ 24000000
 #define FAULT_FREQ 1000
-#define FREQ_TEST 100000
+#define FREQ_TEST 1000000
 #define SLAVE    0
 #define MASTER   1
-
-
-typedef enum {
-    TX_STATE_IDLE = 0,
-    TX_STATE_SENDING,
-} tx_state_t;
 
 // Estructura que contiene los datos del device.
 typedef struct {
@@ -148,12 +167,15 @@ typedef struct {
 
     // Memoria de I2s y Clk
     void __iomem *instance;
+    void __iomem *dat_port;
     struct clk *fck;
     bool clk_enabled;
 
     // Interrupciones
     int irq_tx;
     int irq_rx;
+    uint32_t irq_tx_cnt;
+    uint32_t irq_rx_cnt;
 
     // Exclusión mutua independiente para Tx/Rx y serialización de hardware
     struct mutex tx_lock;
@@ -165,7 +187,6 @@ typedef struct {
     // Parametros de I2S
     uint32_t hertz;
     uint8_t i2s_mode; /* SLAVE (0) o MASTER (1) */
-    tx_state_t tx_state;
 } mymcasp_handler_t;
 
 #endif /* _CIN_DRIVER_H_ */

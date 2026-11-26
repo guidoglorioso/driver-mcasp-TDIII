@@ -8,28 +8,13 @@ static const char __MODULE_NAME__[] = "td3_i2s";
 
 static mymcasp_handler_t *g_handler = NULL;
 
-/////////////////////////
-// configuracion de HW
-/////////////////////////
+//-------------------------------------
+//    Configuracion y manejo de IRQ
+//-------------------------------------
 
-static void mcasp_wait_gblctl(mymcasp_handler_t *handler, uint32_t mask) {
-    int timeout = 1000;
-    while (((ioread32(handler->instance + MCASP_GBLCTL_REG) & mask) != mask) && --timeout > 0) {
-        udelay(1);
-    }
-}
-
-static void mcasp_wait_gblctl_clear(mymcasp_handler_t *handler, uint32_t mask) {
-    int timeout = 1000;
-    while (((ioread32(handler->instance + MCASP_GBLCTL_REG) & mask) != 0) && --timeout > 0) {
-        udelay(1);
-    }
-}
-
-/////////////////////////
-// Handlers IRQ
-/////////////////////////
-
+/**
+ * @brief Habilitacion/Deshabilitacion de interrupcion TX.
+ */
 static void mcasp_irq_tx_enable(mymcasp_handler_t *handler, bool enable) {
     uint32_t reg_val;
 
@@ -37,123 +22,141 @@ static void mcasp_irq_tx_enable(mymcasp_handler_t *handler, bool enable) {
         return;
 
     reg_val = ioread32(handler->instance + MCASP_XINTCTL_REG);
-    if (enable)
-        reg_val |= MCASP_INT_DATA;
-    else
-        reg_val &= ~MCASP_INT_DATA;
+    if (enable) {
+        if (!(reg_val & MCASP_INTCTL_STAFRM))
+            iowrite32(MCASP_STAT_CLEAR_ALL, handler->instance + MCASP_XSTAT_REG);
+        reg_val |= (MCASP_INTCTL_STAFRM | MCASP_XSTAT_XUNDRN);
+    } else {
+        reg_val &= ~(MCASP_INTCTL_STAFRM | MCASP_INT_DATA | MCASP_XSTAT_XUNDRN);
+    }
     iowrite32(reg_val, handler->instance + MCASP_XINTCTL_REG);
 }
 
+/**
+ * @brief Habilitacion/Deshabilitacion de interrupcion RX.
+ */
 static void mcasp_irq_rx_enable(mymcasp_handler_t *handler, bool enable) {
     uint32_t reg_val;
+    uint32_t rlvl;
 
     if (!handler || !handler->instance)
         return;
 
     reg_val = ioread32(handler->instance + MCASP_RINTCTL_REG);
+    
     if (enable) {
-        if (!(reg_val & MCASP_INT_DATA)) {
-            // Descartar palabra vieja latcheada en RBUF1 y limpiar flags de overrun previos
-            (void)MCASP_READ_RX_BUF(handler);
+        if (!(reg_val & MCASP_INTCTL_STAFRM)) {
+            /* AFIFO: Drenar palabras residuales en RFIFO desde dat_port y limpiar flags previos */
+            if (handler->dat_port) {
+                rlvl = ioread32(handler->instance + MCASP_RFIFOSTS_REG) & MCASP_AFIFO_LVL_MASK;
+                if (rlvl > MCASP_AFIFO_DEPTH_WORDS)
+                    rlvl = MCASP_AFIFO_DEPTH_WORDS;
+                while (rlvl-- > 0)
+                    (void)MCASP_READ_DAT(handler);
+            }
             iowrite32(MCASP_STAT_CLEAR_ALL, handler->instance + MCASP_RSTAT_REG);
         }
-        reg_val |= MCASP_INT_DATA;
+        reg_val |= (MCASP_INTCTL_STAFRM | MCASP_RSTAT_ROVRN);
     } else {
-        reg_val &= ~MCASP_INT_DATA;
+        reg_val &= ~(MCASP_INTCTL_STAFRM | MCASP_INT_DATA | MCASP_RSTAT_ROVRN);
     }
     iowrite32(reg_val, handler->instance + MCASP_RINTCTL_REG);
 }
 
-// TODO Revisar registros, hacer clean 
+
+
+static void mcasp_wfifo_fill(mymcasp_handler_t *handler) {
+    uint32_t wlvl;
+
+    /* AFIFO: Leer WLVL en WFIFOSTS y llenar WFIFO por dat_port hasta 64 words */
+    wlvl = ioread32(handler->instance + MCASP_WFIFOSTS_REG) & MCASP_AFIFO_LVL_MASK;
+    if (wlvl > MCASP_AFIFO_DEPTH_WORDS)
+        wlvl = MCASP_AFIFO_DEPTH_WORDS;
+
+    for (; wlvl < MCASP_AFIFO_DEPTH_WORDS; wlvl++)
+        MCASP_WRITE_DAT(handler, cb_pop_word(&handler->tx_buf));
+
+    if (cb_half_free(&handler->tx_buf))
+        wake_up_interruptible(&handler->tx_wq);
+}
+
+//-------------------------------------
+//              Handlers
+//-------------------------------------
+
 static irqreturn_t isr_tx_mcasp(int irq, void *dev_id) {
     mymcasp_handler_t *handler = (mymcasp_handler_t *)dev_id;
     uint32_t xstat;
-    uint32_t word = 0;
     uint32_t reg_val;
-    uint8_t byte;
 
-    if (!handler || !handler->instance || !handler->clk_enabled)
+    if (!handler || !handler->instance || !handler->dat_port || !handler->clk_enabled)
         return IRQ_NONE;
 
-    switch (handler->tx_state) {
-    case TX_STATE_IDLE:
-        word = 0;
-        if (!cb_is_empty(&handler->tx_buf))
-            handler->tx_state = TX_STATE_SENDING;
-        break;
-
-    case TX_STATE_SENDING:
-        if (!cb_is_empty(&handler->tx_buf)) {
-            if (cb_pop(&handler->tx_buf, &byte) == 0) word |= ((uint32_t)byte << 24);
-            if (cb_pop(&handler->tx_buf, &byte) == 0) word |= ((uint32_t)byte << 16);
-            if (cb_pop(&handler->tx_buf, &byte) == 0) word |= ((uint32_t)byte << 8);
-            if (cb_pop(&handler->tx_buf, &byte) == 0) word |= ((uint32_t)byte << 0);
-
-            if (cb_half_free(&handler->tx_buf))
-                wake_up_interruptible(&handler->tx_wq);
-        }
-
-        if (cb_is_empty(&handler->tx_buf))
-            handler->tx_state = TX_STATE_IDLE;
-        break;
-
-    default:
-        handler->tx_state = TX_STATE_IDLE;
-        word = 0;
-        break;
-    }
-
+    handler->irq_tx_cnt++;
     xstat = ioread32(handler->instance + MCASP_XSTAT_REG);
 
-    /*
-     * Recuperación de emergencia solo si ocurrió Underrun (sin tocar XFRST para no cortar AFSX).
-     * Se espera explícitamente a que GBLCTL refleje la baja de XSMRST y XSRCLR antes de rearmar.
-     */
     if (xstat & MCASP_XSTAT_XUNDRN) {
         reg_val = MCASP_GBL_XFRST | MCASP_GBL_XHCLKRST | MCASP_GBL_XCLKRST;
         iowrite32(reg_val, handler->instance + MCASP_XGBLCTL_REG);
-        mcasp_wait_gblctl_clear(handler, MCASP_GBL_XSMRST | MCASP_GBL_XSRCLR);
+        mcasp_wait_reg(handler->instance, MCASP_GBLCTL_REG, MCASP_GBL_XSMRST | MCASP_GBL_XSRCLR, false);
 
         iowrite32(MCASP_STAT_CLEAR_ALL, handler->instance + MCASP_XSTAT_REG);
 
         reg_val |= MCASP_GBL_XSRCLR;
         iowrite32(reg_val, handler->instance + MCASP_XGBLCTL_REG);
-        mcasp_wait_gblctl(handler, MCASP_GBL_XSRCLR);
+        mcasp_wait_reg(handler->instance, MCASP_GBLCTL_REG, MCASP_GBL_XSRCLR, true);
 
-        MCASP_WRITE_TX_BUF(handler, word);
+        /* AFIFO: Precargar WFIFO por dat_port y esperar XDATA=0 antes de soltar XSMRST */
+        mcasp_wfifo_fill(handler);
+        mcasp_wait_reg(handler->instance, MCASP_XSTAT_REG, MCASP_INT_DATA, false);
 
         reg_val |= MCASP_GBL_XSMRST;
         iowrite32(reg_val, handler->instance + MCASP_XGBLCTL_REG);
-        mcasp_wait_gblctl(handler, MCASP_GBL_XSMRST);
+        mcasp_wait_reg(handler->instance, MCASP_GBLCTL_REG, MCASP_GBL_XSMRST, true);
     } else {
-        MCASP_WRITE_TX_BUF(handler, word);
+        /* Limpiar XSTAFRM y demás flags de estado en XSTAT (W1C) según 22.3.13.6 */
+        if (xstat & ~MCASP_INT_DATA)
+            iowrite32(xstat & ~MCASP_INT_DATA, handler->instance + MCASP_XSTAT_REG);
+
+        mcasp_wfifo_fill(handler);
     }
 
     return IRQ_HANDLED;
 }
-// TODO Revisar registros, hacer clean
+
+
 static irqreturn_t isr_rx_mcasp(int irq, void *dev_id) {
     mymcasp_handler_t *handler = (mymcasp_handler_t *)dev_id;
     uint32_t rstat;
+    uint32_t rlvl;
     uint32_t word;
+    bool pushed = false;
 
-    if (!handler || !handler->instance || !handler->clk_enabled)
+    if (!handler || !handler->instance || !handler->dat_port || !handler->clk_enabled)
         return IRQ_NONE;
 
+    handler->irq_rx_cnt++;
     rstat = ioread32(handler->instance + MCASP_RSTAT_REG);
 
-    if (rstat & MCASP_INT_DATA) {
-        word = MCASP_READ_RX_BUF(handler);
+    /* AFIFO: Leer todas las palabras acumuladas en RFIFO (RFIFOSTS.RLVL) desde dat_port */
+    rlvl = ioread32(handler->instance + MCASP_RFIFOSTS_REG) & MCASP_AFIFO_LVL_MASK;
+    if (rlvl > MCASP_AFIFO_DEPTH_WORDS)
+        rlvl = MCASP_AFIFO_DEPTH_WORDS;
+
+    while (rlvl-- > 0) {
+        word = MCASP_READ_DAT(handler);
 
         cb_push(&handler->rx_buf, (uint8_t)((word >> 24) & 0xFF));
         cb_push(&handler->rx_buf, (uint8_t)((word >> 16) & 0xFF));
         cb_push(&handler->rx_buf, (uint8_t)((word >> 8)  & 0xFF));
         cb_push(&handler->rx_buf, (uint8_t)((word >> 0)  & 0xFF));
-
-        wake_up_interruptible(&handler->rx_wq);
+        pushed = true;
     }
 
-    // Limpiar flags de error/estado adicionales en RSTAT si los hubiera
+    if (pushed)
+        wake_up_interruptible(&handler->rx_wq);
+
+    /* Limpiar RSTAFRM y flags de error/estado en RSTAT (W1C) para atender la IRQ según 22.3.13.6 */
     if (rstat & ~MCASP_INT_DATA) {
         iowrite32(rstat & ~MCASP_INT_DATA, handler->instance + MCASP_RSTAT_REG);
     }
@@ -161,9 +164,9 @@ static irqreturn_t isr_rx_mcasp(int irq, void *dev_id) {
     return IRQ_HANDLED;
 }
 
-/////////////////////////
-// Rutinas de inicializacion
-/////////////////////////
+//---------------------------------
+//     Rutinas de inicializacion
+//---------------------------------
 
 static int init_irq(mymcasp_handler_t *handler) {
     int ret;
@@ -297,6 +300,32 @@ static void mcasp_calc_clk_divs(uint32_t target_freq, uint32_t *ahclk_div, uint3
 }
 
 // TODO Revisar registros, hacer clean
+static void mcasp_afifo_flush(mymcasp_handler_t *handler) {
+    /* AFIFO: Poner WENA = 0 y RENA = 0 limpia instantáneamente WFIFO y RFIFO en hardware */
+    iowrite32(ioread32(handler->instance + MCASP_WFIFOCTL_REG) & ~MCASP_WFIFO_WENA,
+              handler->instance + MCASP_WFIFOCTL_REG);
+    iowrite32(ioread32(handler->instance + MCASP_RFIFOCTL_REG) & ~MCASP_RFIFO_RENA,
+              handler->instance + MCASP_RFIFOCTL_REG);
+}
+
+static void mcasp_afifo_enable(mymcasp_handler_t *handler) {
+    uint32_t wfifo_cfg;
+    uint32_t rfifo_cfg;
+
+    /* AFIFO: Paso 1 - Escribir WNUMDMA (1) / WNUMEVT (16 words) con WENA = 0 y RNUMDMA (1) / RNUMEVT (16 words) con RENA = 0 */
+    wfifo_cfg = MCASP_AFIFO_NUMEVT(MCASP_AFIFO_NUMEVT_WORDS) |
+                MCASP_AFIFO_NUMDMA(MCASP_AFIFO_NUMDMA_TX);
+    rfifo_cfg = MCASP_AFIFO_NUMEVT(MCASP_AFIFO_NUMEVT_WORDS) |
+                MCASP_AFIFO_NUMDMA(MCASP_AFIFO_NUMDMA_RX);
+
+    iowrite32(wfifo_cfg, handler->instance + MCASP_WFIFOCTL_REG);
+    iowrite32(rfifo_cfg, handler->instance + MCASP_RFIFOCTL_REG);
+
+    /* AFIFO: Paso 2 - En una segunda escritura levantar WENA = 1 y RENA = 1 (con GBLCTL = 0, antes de los pasos 3-9) */
+    iowrite32(wfifo_cfg | MCASP_WFIFO_WENA, handler->instance + MCASP_WFIFOCTL_REG);
+    iowrite32(rfifo_cfg | MCASP_RFIFO_RENA, handler->instance + MCASP_RFIFOCTL_REG);
+}
+
 static void mcasp_reg_config(mymcasp_handler_t *handler, bool enable){
     uint32_t ahclk_div;
     uint32_t aclk_div;
@@ -312,7 +341,10 @@ static void mcasp_reg_config(mymcasp_handler_t *handler, bool enable){
 
         // Detener clocks y máquinas de estado TX/RX poniendo GBLCTL = 0 y esperar sincronización
         iowrite32(0, handler->instance + MCASP_GBLCTL_REG);
-        mcasp_wait_gblctl_clear(handler, MCASP_GBL_TX_MASK | MCASP_GBL_RX_MASK);
+        mcasp_wait_reg(handler->instance, MCASP_GBLCTL_REG, MCASP_GBL_TX_MASK | MCASP_GBL_RX_MASK, false);
+
+        // AFIFO: Deshabilitar WENA/RENA para hacer flush limpio de las FIFOs de HW al cerrar
+        mcasp_afifo_flush(handler);
         return;
     }
     
@@ -322,7 +354,10 @@ static void mcasp_reg_config(mymcasp_handler_t *handler, bool enable){
     // Paso 1 Transmit/Receive Section Initialization (22.3.12.2)
     // Resetear McASP a valores por defecto poniendo GBLCTL = 0
     iowrite32(0, handler->instance + MCASP_GBLCTL_REG);
-    mcasp_wait_gblctl_clear(handler, MCASP_GBL_TX_MASK | MCASP_GBL_RX_MASK);
+    mcasp_wait_reg(handler->instance, MCASP_GBLCTL_REG, MCASP_GBL_TX_MASK | MCASP_GBL_RX_MASK, false);
+
+    // AFIFO: Deshabilitar WENA/RENA (flush) antes de reconfigurar el McASP
+    mcasp_afifo_flush(handler);
 
     // Paso 2 Transmit/Receive Section Initialization (22.3.12.2)
     // Configurar todos los registros del McASP (excepto GBLCTL) en el orden:
@@ -331,8 +366,9 @@ static void mcasp_reg_config(mymcasp_handler_t *handler, bool enable){
     // 2.b Registros de Recepción: RMASK, RFMT, AFSRCTL, ACLKRCTL, RTDM, RINTCTL
     iowrite32(0xFFFFFFFF, handler->instance + MCASP_RMASK_REG);
 
-    // RDATDLY = 1 (1 ciclo de retardo - estándar I2S), RRVRS = 1 (MSB primero), RSSZ = 32 bits, RBUSEL = 1 (CFG Bus)
-    iowrite32(MCASP_FMT_DATDLY(1) | MCASP_FMT_RVRS_MSB | MCASP_FMT_SSZ_32BIT | MCASP_FMT_BUSEL_CFG,
+    // RDATDLY = 1 (1 ciclo de retardo - estándar I2S), RRVRS = 1 (MSB primero), RSSZ = 32 bits,
+    // AFIFO: RBUSEL = 0 selecciona el Data Port (0x4600_0000) para usar la Read FIFO
+    iowrite32(MCASP_FMT_DATDLY(1) | MCASP_FMT_RVRS_MSB | MCASP_FMT_SSZ_32BIT | MCASP_FMT_BUSEL_DAT,
               handler->instance + MCASP_RFMT_REG);
 
     // Frame Sync I2S de 2 slots (RMOD = 2) y ancho de 1 palabra (FSRDUR)
@@ -355,8 +391,9 @@ static void mcasp_reg_config(mymcasp_handler_t *handler, bool enable){
     // 2.c Registros de Transmisión: XMASK, XFMT, AFSXCTL, ACLKXCTL, AHCLKXCTL, XTDM, XINTCTL
     iowrite32(0xFFFFFFFF, handler->instance + MCASP_XMASK_REG);
 
-    // XDATDLY = 1 (1 ciclo de retardo - estándar I2S), XRVRS = 1 (MSB primero), XSSZ = 32 bits, XBUSEL = 1 (CFG Bus)
-    iowrite32(MCASP_FMT_DATDLY(1) | MCASP_FMT_RVRS_MSB | MCASP_FMT_SSZ_32BIT | MCASP_FMT_BUSEL_CFG,
+    // XDATDLY = 1 (1 ciclo de retardo - estándar I2S), XRVRS = 1 (MSB primero), XSSZ = 32 bits,
+    // AFIFO: XBUSEL = 0 selecciona el Data Port (0x4600_0000) para usar la Write FIFO
+    iowrite32(MCASP_FMT_DATDLY(1) | MCASP_FMT_RVRS_MSB | MCASP_FMT_SSZ_32BIT | MCASP_FMT_BUSEL_DAT,
               handler->instance + MCASP_XFMT_REG);
 
     // Frame Sync I2S de 2 slots (XMOD = 2), ancho de 1 palabra (FSXDUR) y FSXM según modo
@@ -409,29 +446,31 @@ static void mcasp_reg_config(mymcasp_handler_t *handler, bool enable){
 
     // 2.f Registros DIT: No aplica (modo TDM/I2S, no DIT)
 
+    // AFIFO: Configurar WNUMDMA/WNUMEVT y RNUMDMA/RNUMEVT (16 words) y luego habilitar WENA/RENA con GBLCTL = 0
+    mcasp_afifo_enable(handler);
+
     // Paso 3 Transmit/Receive Section Initialization (22.3.12.2)
     // Iniciar los relojes serie de alta frecuencia (XHCLKRST y RHCLKRST)
     xgbl |= MCASP_GBL_XHCLKRST;
     iowrite32(xgbl, handler->instance + MCASP_XGBLCTL_REG);
-    mcasp_wait_gblctl(handler, MCASP_GBL_XHCLKRST);
+    mcasp_wait_reg(handler->instance, MCASP_GBLCTL_REG, MCASP_GBL_XHCLKRST, true);
 
     rgbl |= MCASP_GBL_RHCLKRST;
     iowrite32(rgbl, handler->instance + MCASP_RGBLCTL_REG);
-    mcasp_wait_gblctl(handler, MCASP_GBL_RHCLKRST);
+    mcasp_wait_reg(handler->instance, MCASP_GBLCTL_REG, MCASP_GBL_RHCLKRST, true);
 
     // Paso 4 Transmit/Receive Section Initialization (22.3.12.2)
     // Iniciar los relojes serie (XCLKRST y RCLKRST)
     xgbl |= MCASP_GBL_XCLKRST;
     iowrite32(xgbl, handler->instance + MCASP_XGBLCTL_REG);
-    mcasp_wait_gblctl(handler, MCASP_GBL_XCLKRST);
+    mcasp_wait_reg(handler->instance, MCASP_GBLCTL_REG, MCASP_GBL_XCLKRST, true);
 
     rgbl |= MCASP_GBL_RCLKRST;
     iowrite32(rgbl, handler->instance + MCASP_RGBLCTL_REG);
-    mcasp_wait_gblctl(handler, MCASP_GBL_RCLKRST);
+    mcasp_wait_reg(handler->instance, MCASP_GBLCTL_REG, MCASP_GBL_RCLKRST, true);
 
     // Paso 5 Transmit/Receive Section Initialization (22.3.12.2)
-    // Mantener interrupción de recepción (RDATA) deshabilitada hasta read(); TX (XDATA) se habilita en Paso 7
-    (void)MCASP_READ_RX_BUF(handler);
+    // Mantener interrupción de recepción (RSTAFRM) deshabilitada hasta read(); TX se habilita en Paso 7
     mcasp_irq_rx_enable(handler, false);
 
     // Paso 6 Transmit/Receive Section Initialization (22.3.12.2)
@@ -441,20 +480,21 @@ static void mcasp_reg_config(mymcasp_handler_t *handler, bool enable){
 
     xgbl |= MCASP_GBL_XSRCLR;
     iowrite32(xgbl, handler->instance + MCASP_XGBLCTL_REG);
-    mcasp_wait_gblctl(handler, MCASP_GBL_XSRCLR);
+    mcasp_wait_reg(handler->instance, MCASP_GBLCTL_REG, MCASP_GBL_XSRCLR, true);
 
     rgbl |= MCASP_GBL_RSRCLR;
     iowrite32(rgbl, handler->instance + MCASP_RGBLCTL_REG);
-    mcasp_wait_gblctl(handler, MCASP_GBL_RSRCLR);
+    mcasp_wait_reg(handler->instance, MCASP_GBLCTL_REG, MCASP_GBL_RSRCLR, true);
 
     // Paso 7 Transmit/Receive Section Initialization (22.3.12.2)
-    // Precargar XBUF0 con 0 antes de soltar XSMRST para arrancar transmitiendo 0 sin caer en Underrun
-    handler->tx_state = TX_STATE_IDLE;
-    MCASP_WRITE_TX_BUF(handler, 0);
-    {
-        int timeout = 1000;
-        while ((ioread32(handler->instance + MCASP_XSTAT_REG) & MCASP_INT_DATA) && --timeout > 0)
-            udelay(1);
+    // AFIFO: Precargar WFIFO con ceros por dat_port antes de soltar XSMRST para arrancar sin Underrun
+    if (handler->dat_port) {
+        uint32_t i;
+
+        for (i = 0; i < MCASP_AFIFO_PRELOAD_WORDS; i++)
+            MCASP_WRITE_DAT(handler, 0);
+
+        mcasp_wait_reg(handler->instance, MCASP_XSTAT_REG, MCASP_INT_DATA, false);
     }
     mcasp_irq_tx_enable(handler, true);
 
@@ -462,21 +502,21 @@ static void mcasp_reg_config(mymcasp_handler_t *handler, bool enable){
     // Liberar máquinas de estado de reset (XSMRST y RSMRST)
     xgbl |= MCASP_GBL_XSMRST;
     iowrite32(xgbl, handler->instance + MCASP_XGBLCTL_REG);
-    mcasp_wait_gblctl(handler, MCASP_GBL_XSMRST);
+    mcasp_wait_reg(handler->instance, MCASP_GBLCTL_REG, MCASP_GBL_XSMRST, true);
 
     rgbl |= MCASP_GBL_RSMRST;
     iowrite32(rgbl, handler->instance + MCASP_RGBLCTL_REG);
-    mcasp_wait_gblctl(handler, MCASP_GBL_RSMRST);
+    mcasp_wait_reg(handler->instance, MCASP_GBLCTL_REG, MCASP_GBL_RSMRST, true);
 
     // Paso 9 Transmit/Receive Section Initialization (22.3.12.2)
     // Liberar generadores de Frame Sync de reset (XFRST y RFRST)
     xgbl |= MCASP_GBL_XFRST;
     iowrite32(xgbl, handler->instance + MCASP_XGBLCTL_REG);
-    mcasp_wait_gblctl(handler, MCASP_GBL_XFRST);
+    mcasp_wait_reg(handler->instance, MCASP_GBLCTL_REG, MCASP_GBL_XFRST, true);
 
     rgbl |= MCASP_GBL_RFRST;
     iowrite32(rgbl, handler->instance + MCASP_RGBLCTL_REG);
-    mcasp_wait_gblctl(handler, MCASP_GBL_RFRST);
+    mcasp_wait_reg(handler->instance, MCASP_GBLCTL_REG, MCASP_GBL_RFRST, true);
 
     // Paso 10 Transmit/Receive Section Initialization (22.3.12.2)
     // Las transferencias comienzan en el primer flanco de Frame Sync
@@ -487,7 +527,6 @@ static void mymcasp_tx_stop(mymcasp_handler_t *handler) {
         return;
 
     cb_reset(&handler->tx_buf);
-    handler->tx_state = TX_STATE_IDLE;
 }
 
 static void mymcasp_hw_deinit(mymcasp_handler_t *handler) {
@@ -513,20 +552,20 @@ static void mymcasp_hw_deinit(mymcasp_handler_t *handler) {
         if (handler->irq_rx >= 0)
             synchronize_irq(handler->irq_rx);
 
+        pr_info("%s IRQ count -> TX: %u | RX: %u\n",
+                __MODULE_NAME__, handler->irq_tx_cnt, handler->irq_rx_cnt);
+
         // 3. Poner GBLCTL = 0 y pines de reloj en entrada
         if (handler->instance) {
             mcasp_reg_config(handler, false);
 
-            // 4. Vaciar buffers HW, limpiar RSTAT/XSTAT y resetear buffers SW/estado TX
-            (void)MCASP_READ_RX_BUF(handler);
-            iowrite32(0, handler->instance + MCASP_XBUF0_REG);
+            // 4. Limpiar RSTAT/XSTAT y resetear buffers SW (AFIFO ya flusheada en mcasp_reg_config)
             iowrite32(MCASP_STAT_CLEAR_ALL, handler->instance + MCASP_RSTAT_REG);
             iowrite32(MCASP_STAT_CLEAR_ALL, handler->instance + MCASP_XSTAT_REG);
         }
 
         cb_reset(&handler->tx_buf);
         cb_reset(&handler->rx_buf);
-        handler->tx_state = TX_STATE_IDLE;
 
         // 5. Apagar el clock funcional del periférico
         if (handler->fck)
@@ -551,10 +590,11 @@ static int mymcasp_hw_init(mymcasp_handler_t *handler) {
             return status;
         }
 
-        // Resetear índices de los buffers circulares y estado TX antes de habilitar el McASP
+        // Resetear índices de los buffers circulares y contadores IRQ antes de habilitar el McASP
         cb_reset(&handler->tx_buf);
         cb_reset(&handler->rx_buf);
-        handler->tx_state = TX_STATE_IDLE;
+        handler->irq_tx_cnt = 0;
+        handler->irq_rx_cnt = 0;
 
         // Inicializa el McASP siguiendo la secuencia 22.3.12.2 (Pasos 1 a 10)
         mcasp_reg_config(handler, true);
@@ -1086,6 +1126,22 @@ static int mymcasp_probe(struct platform_device *pdev)
     if (IS_ERR(mymcasp_resource->instance)) {
         pr_err("%s Error al mapear los recursos de memoria\n", __MODULE_NAME__);
         status = PTR_ERR(mymcasp_resource->instance);
+        goto err_mutex;
+    }
+
+    res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "dat");
+    if (!res)
+        res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
+    if (!res) {
+        pr_err("%s No se encontró el recurso de memoria dat en el DT\n", __MODULE_NAME__);
+        status = -ENODEV;
+        goto err_mutex;
+    }
+
+    mymcasp_resource->dat_port = devm_ioremap_resource(&(pdev->dev), res);
+    if (IS_ERR(mymcasp_resource->dat_port)) {
+        pr_err("%s Error al mapear el puerto de datos (dat)\n", __MODULE_NAME__);
+        status = PTR_ERR(mymcasp_resource->dat_port);
         goto err_mutex;
     }
 
