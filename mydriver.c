@@ -571,6 +571,10 @@ static int mymcasp_hw_init(mymcasp_handler_t *handler) {
 // Interfaz Sysfs - (/sys/class/td3_i2s/)
 /////////////////////////
 
+/**
+ * @brief Lee el modo de operación I2S actual (`0` = Slave, `1` = Master) en `buf`.
+ *        Requiere exclusión mutua sobre TX, RX y `/dev/td3_i2s` abierto.
+ */
 static ssize_t master_show(const struct class *cls, const struct class_attribute *attr, char *buf) {
     mymcasp_handler_t *handler = g_handler;
     ssize_t ret;
@@ -602,6 +606,10 @@ static ssize_t master_show(const struct class *cls, const struct class_attribute
     return ret;
 }
 
+/**
+ * @brief Configura el modo I2S desde `buf` (`0`/`SLAVE` o `1`/`MASTER`) y actualiza el McASP.
+ *        Retorna `-EBUSY` si hay transferencias activas o `/dev/td3_i2s` está abierto.
+ */
 static ssize_t master_store(const struct class *cls, const struct class_attribute *attr, const char *buf, size_t count) {
     mymcasp_handler_t *handler = g_handler;
     char kbuf[16];
@@ -662,6 +670,10 @@ static ssize_t master_store(const struct class *cls, const struct class_attribut
 
 static CLASS_ATTR_RW(master);
 
+/**
+ * @brief Lee de forma bloqueante `count` bytes recibidos por I2S hacia `buf` desde sysfs.
+ *        Enciende el HW al iniciar, espera en `TASK_INTERRUPTIBLE` y lo apaga al finalizar.
+ */
 static ssize_t recibir_read(struct file *filp, struct kobject *kobj,
                             struct bin_attribute *attr, char *buf,
                             loff_t off, size_t count) {
@@ -724,6 +736,10 @@ static ssize_t recibir_read(struct file *filp, struct kobject *kobj,
 
 static BIN_ATTR_RO(recibir, 0);
 
+/**
+ * @brief Transmite de forma bloqueante `count` bytes desde `buf` por I2S desde sysfs.
+ *        Enciende el HW, encola en `tx_buf`, espera el vaciado completo y apaga el HW.
+ */
 static ssize_t transmitir_write(struct file *filp, struct kobject *kobj,
                                 struct bin_attribute *attr, char *buf,
                                 loff_t off, size_t count) {
@@ -817,6 +833,9 @@ static const struct attribute_group *td3_i2s_class_groups[] = {
     NULL,
 };
 
+/**
+ * @brief Asigna permisos `0666` al nodo `/dev/td3_i2s` al registrarse en la clase sysfs.
+ */
 static char *td3_i2s_devnode(const struct device *dev, umode_t *mode) {
     if (mode) {
         *mode = 0666; // Permisos de lectura y escritura para todos
@@ -836,6 +855,10 @@ static const struct class td3_i2s_class = {
 /////////////////////////
 
 
+/**
+ * @brief Abre `/dev/td3_i2s` con acceso exclusivo (`-EBUSY` si ya está abierto o sysfs activo)
+ *        e inicializa el reloj y el McASP guardando el handler en `file->private_data`.
+ */
 static int mymcasp_open(struct inode *inode, struct file *file) {
     int status;
     mymcasp_handler_t *handler = container_of(inode->i_cdev, mymcasp_handler_t, mymcasp_cstm_cdev.mymcasp_cdev);
@@ -862,6 +885,10 @@ static int mymcasp_open(struct inode *inode, struct file *file) {
     return 0;
 }
 
+/**
+ * @brief Cierra `/dev/td3_i2s`: espera el vaciado final de `tx_buf` (si el proceso no está
+ *        saliendo por señal), detiene el McASP, apaga el reloj y libera la exclusividad.
+ */
 static int mymcasp_close(struct inode *inode, struct file *file) {
     mymcasp_handler_t *handler = file->private_data;
 
@@ -885,6 +912,10 @@ static int mymcasp_close(struct inode *inode, struct file *file) {
     return 0;
 }
 
+/**
+ * @brief Lee de forma bloqueante `len` bytes recibidos hacia el buffer de usuario `buf`.
+ *        Habilita la IRQ de RX (sin apagarla al salir para permitir lecturas continuas).
+ */
 static ssize_t mymcasp_read(struct file *file, char __user *buf, size_t len, loff_t *offset) {
     mymcasp_handler_t *dev = file->private_data;
     size_t total_read = 0;
@@ -939,6 +970,10 @@ out_copy:
 }
 
 
+/**
+ * @brief Copia `len` bytes desde el buffer de usuario `buf` y los encola en `tx_buf` para TX
+ *        por interrupciones; duerme en `TASK_INTERRUPTIBLE` si el buffer se llena.
+ */
 static ssize_t mymcasp_write(struct file *file, const char __user *buf, size_t len, loff_t *offset) {
     mymcasp_handler_t *dev = file->private_data;
     size_t total_written = 0;
