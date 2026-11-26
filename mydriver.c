@@ -44,10 +44,16 @@ static void mcasp_irq_rx_enable(mymcasp_handler_t *handler, bool enable) {
         return;
 
     reg_val = ioread32(handler->instance + MCASP_RINTCTL_REG);
-    if (enable)
+    if (enable) {
+        if (!(reg_val & MCASP_INT_DATA)) {
+            // Descartar palabra vieja latcheada en RBUF1 y limpiar flags de overrun previos
+            (void)MCASP_READ_RX_BUF(handler);
+            iowrite32(MCASP_STAT_CLEAR_ALL, handler->instance + MCASP_RSTAT_REG);
+        }
         reg_val |= MCASP_INT_DATA;
-    else
+    } else {
         reg_val &= ~MCASP_INT_DATA;
+    }
     iowrite32(reg_val, handler->instance + MCASP_RINTCTL_REG);
 }
 
@@ -55,80 +61,66 @@ static void mcasp_irq_rx_enable(mymcasp_handler_t *handler, bool enable) {
 static irqreturn_t isr_tx_mcasp(int irq, void *dev_id) {
     mymcasp_handler_t *handler = (mymcasp_handler_t *)dev_id;
     uint32_t xstat;
-    uint32_t gbl;
     uint32_t word = 0;
     uint32_t reg_val;
     uint8_t byte;
-    static uint32_t cont = 0;
+
     if (!handler || !handler->instance || !handler->clk_enabled)
         return IRQ_NONE;
 
-    /*
-     * Extraer la palabra desde el buffer circular de TX (tx_buf).
-     * Si cb_pop devuelve -ENODATA (buffer vacío), deshabilitamos la interrupción
-     * XDATA en XINTCTL para evitar un interrupt storm.
-     */
+    switch (handler->tx_state) {
+    case TX_STATE_IDLE:
+        word = 0;
+        if (!cb_is_empty(&handler->tx_buf))
+            handler->tx_state = TX_STATE_SENDING;
+        break;
 
-    if (cb_pop(&handler->tx_buf, &byte) == -ENODATA) {
-        mcasp_irq_tx_enable(handler, false);
-        //TODO Remover:
-        pr_info("Se reseteo la MDE %d veces durante el envio del buffer\n", cont);
-        cont = 0;
-    
-        return IRQ_HANDLED;
+    case TX_STATE_SENDING:
+        if (!cb_is_empty(&handler->tx_buf)) {
+            if (cb_pop(&handler->tx_buf, &byte) == 0) word |= ((uint32_t)byte << 24);
+            if (cb_pop(&handler->tx_buf, &byte) == 0) word |= ((uint32_t)byte << 16);
+            if (cb_pop(&handler->tx_buf, &byte) == 0) word |= ((uint32_t)byte << 8);
+            if (cb_pop(&handler->tx_buf, &byte) == 0) word |= ((uint32_t)byte << 0);
+
+            if (cb_half_free(&handler->tx_buf))
+                wake_up_interruptible(&handler->tx_wq);
+        }
+
+        if (cb_is_empty(&handler->tx_buf))
+            handler->tx_state = TX_STATE_IDLE;
+        break;
+
+    default:
+        handler->tx_state = TX_STATE_IDLE;
+        word = 0;
+        break;
     }
 
-    // Formo word para enviar al buff del serializador
-
-    word = ((uint32_t)byte << 24);
-    if (cb_pop(&handler->tx_buf, &byte) == 0) word |= ((uint32_t)byte << 16);
-    if (cb_pop(&handler->tx_buf, &byte) == 0) word |= ((uint32_t)byte << 8);
-    if (cb_pop(&handler->tx_buf, &byte) == 0) word |= ((uint32_t)byte << 0);
-   
-    // Registros de estado de MDE y modulo MCASP
     xstat = ioread32(handler->instance + MCASP_XSTAT_REG);
-    gbl   = ioread32(handler->instance + MCASP_GBLCTL_REG);
 
     /*
-     * Si el transmisor entró en Underrun (bit 0 de XSTAT) mientras estaba inactivo
-     * o si la máquina de estados TX (bit 11 XSMRST) aún no arrancó, el McASP exige
-     * resetear XSMRST/XSRCLR, limpiar XSTAT, cargar XBUF0 y recién liberar XSMRST/XFRST.
+     * Recuperación de emergencia solo si ocurrió Underrun (sin tocar XFRST para no cortar AFSX).
      */
-    if ((xstat & MCASP_XSTAT_XUNDRN) || !(gbl & MCASP_GBL_XSMRST)) {
-        // Debug
-        cont++;
-
+    if (xstat & MCASP_XSTAT_XUNDRN) {
         reg_val = ioread32(handler->instance + MCASP_XGBLCTL_REG);
-        reg_val &= ~(MCASP_GBL_XFRST | MCASP_GBL_XSMRST | MCASP_GBL_XSRCLR);
+        reg_val &= ~(MCASP_GBL_XSMRST | MCASP_GBL_XSRCLR);
         iowrite32(reg_val, handler->instance + MCASP_XGBLCTL_REG);
-        udelay(5); // TODO Ver de remover delays
 
-        // Limpiar todos los flags de estado/error de TX
         iowrite32(MCASP_STAT_CLEAR_ALL, handler->instance + MCASP_XSTAT_REG);
 
-        // Activar serializer TX (XSRCLR)
         reg_val |= MCASP_GBL_XSRCLR;
         iowrite32(reg_val, handler->instance + MCASP_XGBLCTL_REG);
         mcasp_wait_gblctl(handler, MCASP_GBL_XSRCLR);
 
-        // Cargar la palabra inicial en XBUF0 ANTES de soltar XSMRST
-        iowrite32(word, handler->instance + MCASP_XBUF0_REG);
+        MCASP_WRITE_TX_BUF(handler, word);
 
-        // Liberar máquina de estados TX (XSMRST) y Frame Sync (XFRST)
         reg_val |= MCASP_GBL_XSMRST;
         iowrite32(reg_val, handler->instance + MCASP_XGBLCTL_REG);
         mcasp_wait_gblctl(handler, MCASP_GBL_XSMRST);
-
-        reg_val |= MCASP_GBL_XFRST;
-        iowrite32(reg_val, handler->instance + MCASP_XGBLCTL_REG);
-        mcasp_wait_gblctl(handler, MCASP_GBL_XFRST);
-
     } else {
-        iowrite32(word, handler->instance + MCASP_XBUF0_REG);
+        MCASP_WRITE_TX_BUF(handler, word);
     }
 
-    if (cb_half_free(&handler->tx_buf))
-        wake_up_interruptible(&handler->tx_wq);
     return IRQ_HANDLED;
 }
 // TODO Revisar registros, hacer clean
@@ -314,7 +306,8 @@ static void mcasp_reg_config(mymcasp_handler_t *handler, bool enable){
         iowrite32(reg_val, handler->instance + MCASP_RGBLCTL_REG);
         return;
     }
-
+    
+    // calculo divisores de clocks.
     mcasp_calc_clk_divs(handler->hertz, &ahclk_div, &aclk_div);
 
     // Paso 1 Transmit/Receive Section Initialization (22.3.12.2)
@@ -451,7 +444,15 @@ static void mcasp_reg_config(mymcasp_handler_t *handler, bool enable){
     mcasp_wait_gblctl(handler, MCASP_GBL_RSRCLR);
 
     // Paso 7 Transmit/Receive Section Initialization (22.3.12.2)
-    // Verificar buffers de TX: los datos se cargan bajo demanda en write() / isr_tx_mcasp
+    // Precargar XBUF0 con 0 antes de soltar XSMRST para arrancar transmitiendo 0 sin caer en Underrun
+    handler->tx_state = TX_STATE_IDLE;
+    MCASP_WRITE_TX_BUF(handler, 0);
+    {
+        int timeout = 1000;
+        while ((ioread32(handler->instance + MCASP_XSTAT_REG) & MCASP_INT_DATA) && --timeout > 0)
+            udelay(1);
+    }
+    mcasp_irq_tx_enable(handler, true);
 
     // Paso 8 Transmit/Receive Section Initialization (22.3.12.2)
     // Liberar máquinas de estado de reset (XSMRST y RSMRST)
@@ -485,17 +486,8 @@ static void mymcasp_tx_stop(mymcasp_handler_t *handler) {
     if (!handler)
         return;
 
-    mutex_lock(&handler->hw_lock);
-    if (handler->instance && handler->clk_enabled) {
-        mcasp_irq_tx_enable(handler, false);
-        iowrite32(0xFFFF, handler->instance + MCASP_XSTAT_REG);
-    }
-    mutex_unlock(&handler->hw_lock);
-
-    if (handler->irq_tx >= 0)
-        synchronize_irq(handler->irq_tx);
-
     cb_reset(&handler->tx_buf);
+    handler->tx_state = TX_STATE_IDLE;
 }
 
 static void mymcasp_hw_deinit(mymcasp_handler_t *handler) {

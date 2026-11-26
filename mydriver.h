@@ -118,6 +118,11 @@
 #define MASTER   1
 
 
+typedef enum {
+    TX_STATE_IDLE = 0,
+    TX_STATE_SENDING,
+} tx_state_t;
+
 // Estructura que contiene los datos del device.
 typedef struct {
     dev_t mymcasp_dev;
@@ -158,6 +163,7 @@ typedef struct {
     // Parametros de I2S
     uint32_t hertz;
     uint8_t i2s_mode; /* SLAVE (0) o MASTER (1) */
+    tx_state_t tx_state;
 } mymcasp_handler_t;
 
 #endif /* _CIN_DRIVER_H_ */
