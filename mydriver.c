@@ -23,6 +23,34 @@ static void mcasp_wait_gblctl(mymcasp_handler_t *handler, uint32_t mask) {
 // Handlers IRQ
 /////////////////////////
 
+static void mcasp_irq_tx_enable(mymcasp_handler_t *handler, bool enable) {
+    uint32_t reg_val;
+
+    if (!handler || !handler->instance)
+        return;
+
+    reg_val = ioread32(handler->instance + MCASP_XINTCTL_REG);
+    if (enable)
+        reg_val |= MCASP_INT_DATA;
+    else
+        reg_val &= ~MCASP_INT_DATA;
+    iowrite32(reg_val, handler->instance + MCASP_XINTCTL_REG);
+}
+
+static void mcasp_irq_rx_enable(mymcasp_handler_t *handler, bool enable) {
+    uint32_t reg_val;
+
+    if (!handler || !handler->instance)
+        return;
+
+    reg_val = ioread32(handler->instance + MCASP_RINTCTL_REG);
+    if (enable)
+        reg_val |= MCASP_INT_DATA;
+    else
+        reg_val &= ~MCASP_INT_DATA;
+    iowrite32(reg_val, handler->instance + MCASP_RINTCTL_REG);
+}
+
 // TODO Revisar registros, hacer clean 
 static irqreturn_t isr_tx_mcasp(int irq, void *dev_id) {
     mymcasp_handler_t *handler = (mymcasp_handler_t *)dev_id;
@@ -42,9 +70,7 @@ static irqreturn_t isr_tx_mcasp(int irq, void *dev_id) {
      */
 
     if (cb_pop(&handler->tx_buf, &byte) == -ENODATA) {
-        reg_val = ioread32(handler->instance + MCASP_XINTCTL_REG);
-        reg_val &= ~MCASP_INT_DATA;
-        iowrite32(reg_val, handler->instance + MCASP_XINTCTL_REG);
+        mcasp_irq_tx_enable(handler, false);
         //TODO Remover:
         pr_info("Se reseteo la MDE %d veces durante el envio del buffer\n", cont);
         cont = 0;
@@ -101,7 +127,8 @@ static irqreturn_t isr_tx_mcasp(int irq, void *dev_id) {
         iowrite32(word, handler->instance + MCASP_XBUF0_REG);
     }
 
-    wake_up_interruptible(&handler->tx_wq);
+    if (cb_half_free(&handler->tx_buf))
+        wake_up_interruptible(&handler->tx_wq);
     return IRQ_HANDLED;
 }
 // TODO Revisar registros, hacer clean
@@ -312,7 +339,7 @@ static void mcasp_reg_config(mymcasp_handler_t *handler, bool enable){
     iowrite32(0x00000003, handler->instance + MCASP_RTDM_REG);
 
     // Mantener RINTCTL deshabilitado hasta el Paso 5
-    iowrite32(0, handler->instance + MCASP_RINTCTL_REG);
+    mcasp_irq_rx_enable(handler, false);
 
     // 2.c Registros de Transmisión: XMASK, XFMT, AFSXCTL, ACLKXCTL, AHCLKXCTL, XTDM, XINTCTL
     iowrite32(0xFFFFFFFF, handler->instance + MCASP_XMASK_REG);
@@ -347,7 +374,7 @@ static void mcasp_reg_config(mymcasp_handler_t *handler, bool enable){
     iowrite32(0x00000003, handler->instance + MCASP_XTDM_REG);
 
     // Mantener XINTCTL deshabilitado hasta que write() cargue datos en tx_buf
-    iowrite32(0, handler->instance + MCASP_XINTCTL_REG);
+    mcasp_irq_tx_enable(handler, false);
 
     // 2.d Registros de Serializers: SRCTL0 (TX) y SRCTL1 (RX)
     reg_val = ioread32(handler->instance + MCASP_SRCTL0_REG);
@@ -396,9 +423,9 @@ static void mcasp_reg_config(mymcasp_handler_t *handler, bool enable){
     mcasp_wait_gblctl(handler, (1 << 0));
 
     // Paso 5 Transmit/Receive Section Initialization (22.3.12.2)
-    // Habilitar interrupción de recepción (RDATA); TX (XDATA) se habilita en write() al cargar tx_buf
+    // Mantener interrupción de recepción (RDATA) deshabilitada hasta read(); TX (XDATA) se habilita en write()
     (void)MCASP_READ_RX_BUF(handler);
-    iowrite32(MCASP_INT_DATA, handler->instance + MCASP_RINTCTL_REG);
+    mcasp_irq_rx_enable(handler, false);
 
     // Paso 6 Transmit/Receive Section Initialization (22.3.12.2)
     // Limpiar XSTAT y RSTAT (FFFFh) y activar serializers (XSRCLR y RSRCLR)
@@ -446,16 +473,39 @@ static void mcasp_reg_config(mymcasp_handler_t *handler, bool enable){
     // Las transferencias comienzan en el primer flanco de Frame Sync
 }
 
-static void mymcasp_hw_deinit(mymcasp_handler_t *handler) {
+static void mymcasp_tx_stop(mymcasp_handler_t *handler) {
     if (!handler)
         return;
 
-    // Detener transferencias y apagar el reloj del periférico
-    if (handler->clk_enabled) {
+    mutex_lock(&handler->hw_lock);
+    if (handler->instance && handler->clk_enabled) {
+        mcasp_irq_tx_enable(handler, false);
+        iowrite32(0xFFFF, handler->instance + MCASP_XSTAT_REG);
+    }
+    mutex_unlock(&handler->hw_lock);
+
+    if (handler->irq_tx >= 0)
+        synchronize_irq(handler->irq_tx);
+
+    cb_reset(&handler->tx_buf);
+}
+
+static void mymcasp_hw_deinit(mymcasp_handler_t *handler) {
+    bool disable_hw = false;
+
+    if (!handler)
+        return;
+
+    // Detener transferencias y apagar el reloj del periférico solo cuando no quedan usuarios activos
+    mutex_lock(&handler->hw_lock);
+    if (handler->hw_users > 0)
+        handler->hw_users--;
+
+    if (handler->hw_users == 0 && handler->clk_enabled) {
         // Deshabilitar interrupciones de TX y RX, vaciar los buffers de 32 bits de hardware RX (RBUF1) y TX (XBUF0) y limpiar estados
         if (handler->instance) {
-            iowrite32(0, handler->instance + MCASP_XINTCTL_REG);
-            iowrite32(0, handler->instance + MCASP_RINTCTL_REG);
+            mcasp_irq_tx_enable(handler, false);
+            mcasp_irq_rx_enable(handler, false);
             (void)MCASP_READ_RX_BUF(handler);
             iowrite32(0, handler->instance + MCASP_XBUF0_REG);
             iowrite32(0xFFFF, handler->instance + MCASP_RSTAT_REG);
@@ -463,36 +513,51 @@ static void mymcasp_hw_deinit(mymcasp_handler_t *handler) {
         }
 
         mcasp_reg_config(handler, false);
-        if (handler->fck) {
-            clk_disable_unprepare(handler->fck);
-        }
         handler->clk_enabled = false;
+        disable_hw = true;
     }
+    mutex_unlock(&handler->hw_lock);
 
-    cb_reset(&handler->tx_buf);
+    if (disable_hw) {
+        if (handler->irq_tx >= 0)
+            synchronize_irq(handler->irq_tx);
+        if (handler->irq_rx >= 0)
+            synchronize_irq(handler->irq_rx);
+
+        if (handler->fck)
+            clk_disable_unprepare(handler->fck);
+
+        cb_reset(&handler->tx_buf);
+    }
 }
 
 static int mymcasp_hw_init(mymcasp_handler_t *handler) {
-    int status;
+    int status = 0;
 
     if (!handler || !handler->instance)
         return -ENODEV;
 
-    if (handler->clk_enabled)
-        return 0;
+    mutex_lock(&handler->hw_lock);
 
-    // Clock Gating
-    status = init_clock(handler);
-    if (status)
-        return status;
+    if (handler->hw_users == 0) {
+        // Clock Gating
+        status = init_clock(handler);
+        if (status){
+            mutex_unlock(&handler->hw_lock);
+            return status;
+        }
 
-    // Resetear índices del buffer circular de Tx antes de habilitar el McASP; Rx conserva datos previos
-    cb_reset(&handler->tx_buf);
+        // Resetear índices del buffer circular de Tx antes de habilitar el McASP; Rx conserva datos previos
+        cb_reset(&handler->tx_buf);
 
-    // Inicializa el McASP siguiendo la secuencia 22.3.12.2 (Pasos 1 a 10)
-    mcasp_reg_config(handler, true);
+        // Inicializa el McASP siguiendo la secuencia 22.3.12.2 (Pasos 1 a 10)
+        mcasp_reg_config(handler, true);
+    }
 
-    return 0;
+    handler->hw_users++;
+
+    mutex_unlock(&handler->hw_lock);
+    return status;
 }
 
 
@@ -507,12 +572,27 @@ static ssize_t master_show(const struct class *cls, const struct class_attribute
     if (!handler || !handler->instance)
         return -ENODEV;
 
-    if (!mutex_trylock(&handler->lock))
+    if (!mutex_trylock(&handler->tx_lock))
         return -EBUSY;
+
+    if (!mutex_trylock(&handler->rx_lock)) {
+        mutex_unlock(&handler->tx_lock);
+        return -EBUSY;
+    }
+
+    mutex_lock(&handler->hw_lock);
+    if (handler->dev_opened) {
+        mutex_unlock(&handler->hw_lock);
+        mutex_unlock(&handler->rx_lock);
+        mutex_unlock(&handler->tx_lock);
+        return -EBUSY;
+    }
+    mutex_unlock(&handler->hw_lock);
 
     ret = sysfs_emit(buf, "%u\n", handler->i2s_mode);
 
-    mutex_unlock(&handler->lock);
+    mutex_unlock(&handler->rx_lock);
+    mutex_unlock(&handler->tx_lock);
     return ret;
 }
 
@@ -527,11 +607,26 @@ static ssize_t master_store(const struct class *cls, const struct class_attribut
     if (!handler || !handler->instance)
         return -ENODEV;
 
-    if (!mutex_trylock(&handler->lock))
+    if (!mutex_trylock(&handler->tx_lock))
         return -EBUSY;
 
+    if (!mutex_trylock(&handler->rx_lock)) {
+        mutex_unlock(&handler->tx_lock);
+        return -EBUSY;
+    }
+
+    mutex_lock(&handler->hw_lock);
+    if (handler->dev_opened) {
+        mutex_unlock(&handler->hw_lock);
+        mutex_unlock(&handler->rx_lock);
+        mutex_unlock(&handler->tx_lock);
+        return -EBUSY;
+    }
+    mutex_unlock(&handler->hw_lock);
+
     if (count == 0) {
-        mutex_unlock(&handler->lock);
+        mutex_unlock(&handler->rx_lock);
+        mutex_unlock(&handler->tx_lock);
         return -EINVAL;
     }
 
@@ -545,12 +640,14 @@ static ssize_t master_store(const struct class *cls, const struct class_attribut
     } else if (strcmp(arg, "0") == 0 || strcasecmp(arg, "SLAVE") == 0 || strcasecmp(arg, "ESCLAVO") == 0) {
         mode = SLAVE;
     } else {
-        mutex_unlock(&handler->lock);
+        mutex_unlock(&handler->rx_lock);
+        mutex_unlock(&handler->tx_lock);
         return -EINVAL;
     }
 
     ret = set_i2s_mode(handler, mode);
-    mutex_unlock(&handler->lock);
+    mutex_unlock(&handler->rx_lock);
+    mutex_unlock(&handler->tx_lock);
     if (ret < 0)
         return ret;
 
@@ -573,38 +670,49 @@ static ssize_t recibir_read(struct file *filp, struct kobject *kobj,
     if (off > 0)
         return 0;
 
-    if (!mutex_trylock(&handler->lock))
+    if (!mutex_trylock(&handler->rx_lock))
         return -EBUSY;
+
+    mutex_lock(&handler->hw_lock);
+    if (handler->dev_opened) {
+        mutex_unlock(&handler->hw_lock);
+        mutex_unlock(&handler->rx_lock);
+        return -EBUSY;
+    }
+    mutex_unlock(&handler->hw_lock);
 
     ret = mymcasp_hw_init(handler);
     if (ret < 0) {
-        mutex_unlock(&handler->lock);
+        mutex_unlock(&handler->rx_lock);
         return ret;
     }
 
     if (count == 0) {
         mymcasp_hw_deinit(handler);
-        mutex_unlock(&handler->lock);
+        mutex_unlock(&handler->rx_lock);
         return 0;
     }
 
     count = min_t(size_t, count, BUFF_SIZE);
 
-    while (read_bytes < count) {
-        if (cb_pop(&handler->rx_buf, &byte) == 0) {
+    mcasp_irq_rx_enable(handler, true);
+    if (wait_event_interruptible(handler->rx_wq, cb_count(&handler->rx_buf) >= count)) {
+        mcasp_irq_rx_enable(handler, false);
+        while (read_bytes < count && cb_pop(&handler->rx_buf, &byte) == 0) {
             buf[read_bytes++] = (char)byte;
-            continue;
         }
+        mymcasp_hw_deinit(handler);
+        mutex_unlock(&handler->rx_lock);
+        return read_bytes > 0 ? read_bytes : -ERESTARTSYS;
+    }
+    mcasp_irq_rx_enable(handler, false);
 
-        if (wait_event_interruptible(handler->rx_wq, !cb_is_empty(&handler->rx_buf))) {
-            mymcasp_hw_deinit(handler);
-            mutex_unlock(&handler->lock);
-            return read_bytes > 0 ? read_bytes : -ERESTARTSYS;
-        }
+    while (read_bytes < count && cb_pop(&handler->rx_buf, &byte) == 0) {
+        buf[read_bytes++] = (char)byte;
     }
 
     mymcasp_hw_deinit(handler);
-    mutex_unlock(&handler->lock);
+    mutex_unlock(&handler->rx_lock);
     return read_bytes;
 }
 
@@ -615,24 +723,31 @@ static ssize_t transmitir_write(struct file *filp, struct kobject *kobj,
                                 loff_t off, size_t count) {
     mymcasp_handler_t *handler = g_handler;
     size_t written = 0;
-    uint32_t reg_val;
     int ret;
 
     if (!handler || !handler->instance)
         return -ENODEV;
 
-    if (!mutex_trylock(&handler->lock))
+    if (!mutex_trylock(&handler->tx_lock))
         return -EBUSY;
+
+    mutex_lock(&handler->hw_lock);
+    if (handler->dev_opened) {
+        mutex_unlock(&handler->hw_lock);
+        mutex_unlock(&handler->tx_lock);
+        return -EBUSY;
+    }
+    mutex_unlock(&handler->hw_lock);
 
     ret = mymcasp_hw_init(handler);
     if (ret < 0) {
-        mutex_unlock(&handler->lock);
+        mutex_unlock(&handler->tx_lock);
         return ret;
     }
 
     if (count == 0) {
         mymcasp_hw_deinit(handler);
-        mutex_unlock(&handler->lock);
+        mutex_unlock(&handler->tx_lock);
         return 0;
     }
 
@@ -645,30 +760,29 @@ static ssize_t transmitir_write(struct file *filp, struct kobject *kobj,
         }
 
         // Habilitar IRQ de TX para que isr_tx_mcasp libere espacio en tx_buf
-        reg_val = ioread32(handler->instance + MCASP_XINTCTL_REG);
-        reg_val |= MCASP_INT_DATA;
-        iowrite32(reg_val, handler->instance + MCASP_XINTCTL_REG);
+        mcasp_irq_tx_enable(handler, true);
 
-        if (wait_event_interruptible(handler->tx_wq, !cb_is_full(&handler->tx_buf))) {
+        if (wait_event_interruptible(handler->tx_wq, cb_half_free(&handler->tx_buf))) {
+            mymcasp_tx_stop(handler);
             mymcasp_hw_deinit(handler);
-            mutex_unlock(&handler->lock);
+            mutex_unlock(&handler->tx_lock);
             return written > 0 ? written : -ERESTARTSYS;
         }
     }
 
     // Habilito la interrupcion del Tx y espero a que se transmita el buffer antes de apagar el HW
-    reg_val = ioread32(handler->instance + MCASP_XINTCTL_REG);
-    reg_val |= MCASP_INT_DATA;
-    iowrite32(reg_val, handler->instance + MCASP_XINTCTL_REG);
+    mcasp_irq_tx_enable(handler, true);
 
     if (wait_event_interruptible(handler->tx_wq, cb_is_empty(&handler->tx_buf))) {
+        mymcasp_tx_stop(handler);
         mymcasp_hw_deinit(handler);
-        mutex_unlock(&handler->lock);
+        mutex_unlock(&handler->tx_lock);
         return written > 0 ? written : -ERESTARTSYS;
     }
 
+    mymcasp_tx_stop(handler);
     mymcasp_hw_deinit(handler);
-    mutex_unlock(&handler->lock);
+    mutex_unlock(&handler->tx_lock);
     return written;
 }
 
@@ -718,23 +832,25 @@ static const struct class td3_i2s_class = {
 
 static int mymcasp_open(struct inode *inode, struct file *file) {
     int status;
-    
     mymcasp_handler_t *handler = container_of(inode->i_cdev, mymcasp_handler_t, mymcasp_cstm_cdev.mymcasp_cdev);
 
-    // Exclusión mutua: si el dispositivo ya está abierto por otro proceso, retornar -EBUSY
-    if (!mutex_trylock(&handler->lock)) {
+    // Exclusión mutua de apertura: si el dispositivo ya está abierto o sysfs está usando Tx/Rx, retornar -EBUSY
+    mutex_lock(&handler->hw_lock);
+    if (handler->dev_opened || mutex_is_locked(&handler->tx_lock) || mutex_is_locked(&handler->rx_lock)) {
+        mutex_unlock(&handler->hw_lock);
         pr_warn("%s Dispositivo en uso\n", __MODULE_NAME__);
         return -EBUSY;
     }
+    handler->dev_opened = true;
+    mutex_unlock(&handler->hw_lock);
 
     status = mymcasp_hw_init(handler);
     if (status) {
-        mutex_unlock(&handler->lock);
+        mutex_lock(&handler->hw_lock);
+        handler->dev_opened = false;
+        mutex_unlock(&handler->hw_lock);
         return status;
     }
-
-    // // TODO: REMOVER -- (Hardcodeo que arranque en master para prueba de loopback sin depender de sysfs)
-    // set_i2s_mode(handler, MASTER);
 
     file->private_data = handler;
 
@@ -746,12 +862,16 @@ static int mymcasp_close(struct inode *inode, struct file *file) {
     mymcasp_handler_t *handler = file->private_data;
 
     if (handler) {
+        mymcasp_tx_stop(handler);
         mymcasp_hw_deinit(handler);
-        mutex_unlock(&handler->lock);
+
+        mutex_lock(&handler->hw_lock);
+        handler->dev_opened = false;
+        mutex_unlock(&handler->hw_lock);
     }
 
     file->private_data = NULL;
-    pr_info("%s Dispositivo Abierto\n", __MODULE_NAME__);
+    pr_info("%s Dispositivo Cerrado\n", __MODULE_NAME__);
     return 0;
 }
 
@@ -769,34 +889,46 @@ static ssize_t mymcasp_read(struct file *file, char __user *buf, size_t len, lof
     if (len == 0)
         return 0;
 
+    if (!mutex_trylock(&dev->rx_lock))
+        return -EBUSY;
+
     len = min_t(size_t, len, BUFF_SIZE);
 
     kbuff = kmalloc(len, GFP_KERNEL);
     if (kbuff == NULL) {
         pr_err("%s Fallo en Kmalloc\n", __MODULE_NAME__);
+        mutex_unlock(&dev->rx_lock);
         return -ENOMEM;
     }
 
-    while (total_read < len) {
-        if (cb_pop(&dev->rx_buf, &byte) == 0) {
+    mcasp_irq_rx_enable(dev, true);
+    if (wait_event_interruptible(dev->rx_wq, cb_count(&dev->rx_buf) >= len)) {
+        mcasp_irq_rx_enable(dev, false);
+        while (total_read < len && cb_pop(&dev->rx_buf, &byte) == 0) {
             kbuff[total_read++] = byte;
-            continue;
         }
-
-        if (wait_event_interruptible(dev->rx_wq, !cb_is_empty(&dev->rx_buf))) {
-            if (total_read > 0)
-                break;
+        if (total_read == 0) {
             kfree(kbuff);
+            mutex_unlock(&dev->rx_lock);
             return -ERESTARTSYS;
         }
+        goto out_copy;
+    }
+    mcasp_irq_rx_enable(dev, false);
+
+    while (total_read < len && cb_pop(&dev->rx_buf, &byte) == 0) {
+        kbuff[total_read++] = byte;
     }
 
+out_copy:
     if (copy_to_user(buf, kbuff, total_read)) {
         kfree(kbuff);
+        mutex_unlock(&dev->rx_lock);
         return -EFAULT;
     }
 
     kfree(kbuff);
+    mutex_unlock(&dev->rx_lock);
     return total_read;
 }
 
@@ -805,7 +937,6 @@ static ssize_t mymcasp_write(struct file *file, const char __user *buf, size_t l
     mymcasp_handler_t *dev = file->private_data;
     size_t total_written = 0;
     uint8_t *kbuff;
-    uint32_t reg_val;
 
     if (!dev || !dev->instance)
         return -ENODEV;
@@ -813,15 +944,20 @@ static ssize_t mymcasp_write(struct file *file, const char __user *buf, size_t l
     if (len == 0)
         return 0;
 
+    if (!mutex_trylock(&dev->tx_lock))
+        return -EBUSY;
+
     len = min_t(size_t, len, BUFF_SIZE);
     kbuff = kmalloc(len, GFP_KERNEL);
     if (kbuff == NULL) {
         pr_err("%s Fallo en kmalloc\n", __MODULE_NAME__);
+        mutex_unlock(&dev->tx_lock);
         return -ENOMEM;
     }
 
     if (copy_from_user(kbuff, buf, len)) {
         kfree(kbuff);
+        mutex_unlock(&dev->tx_lock);
         return -EFAULT;
     }
 
@@ -833,12 +969,11 @@ static ssize_t mymcasp_write(struct file *file, const char __user *buf, size_t l
         }
 
         // Asegurar IRQ de TX habilitada para que isr_tx_mcasp libere espacio
-        reg_val = ioread32(dev->instance + MCASP_XINTCTL_REG);
-        reg_val |= MCASP_INT_DATA;
-        iowrite32(reg_val, dev->instance + MCASP_XINTCTL_REG);
+        mcasp_irq_tx_enable(dev, true);
 
-        if (wait_event_interruptible(dev->tx_wq, !cb_is_full(&dev->tx_buf))) {
+        if (wait_event_interruptible(dev->tx_wq, cb_half_free(&dev->tx_buf))) {
             kfree(kbuff);
+            mutex_unlock(&dev->tx_lock);
             return total_written > 0 ? total_written : -ERESTARTSYS;
         }
     }
@@ -847,17 +982,17 @@ static ssize_t mymcasp_write(struct file *file, const char __user *buf, size_t l
 
     // Si se cargaron datos, habilitar la interrupción XDATA de TX y esperar a que termine de transmitir
     if (total_written > 0) {
-        reg_val = ioread32(dev->instance + MCASP_XINTCTL_REG);
-        reg_val |= MCASP_INT_DATA;
-        iowrite32(reg_val, dev->instance + MCASP_XINTCTL_REG);
+        mcasp_irq_tx_enable(dev, true);
 
         if (wait_event_interruptible(dev->tx_wq, cb_is_empty(&dev->tx_buf))) {
+            mutex_unlock(&dev->tx_lock);
             return total_written > 0 ? total_written : -ERESTARTSYS;
         }
     }
 
     pr_info("%s Escritura en el dispositivo (%zu bytes)\n", __MODULE_NAME__, total_written);
 
+    mutex_unlock(&dev->tx_lock);
     return total_written;
 }
 
@@ -874,6 +1009,9 @@ static struct file_operations mymcasp_fops = {
 // Funciones de descubrimiento de HW
 /////////////////////////
 
+/**
+ * @brief Inicializa el dispositivo de plataforma McASP.
+ */
 static int mymcasp_probe(struct platform_device *pdev)
 {
     int status;
@@ -887,43 +1025,47 @@ static int mymcasp_probe(struct platform_device *pdev)
     if (!mymcasp_resource)
         return -ENOMEM;
 
-    // 2. Inicializar campos, buffers circulares, colas de espera y mutex.
+    // 2. Inicializar campos, buffers circulares, colas de espera y mutexs.
     mymcasp_resource->pdev = pdev;
     cb_init(&mymcasp_resource->tx_buf, false);
     cb_init(&mymcasp_resource->rx_buf, true);
     init_waitqueue_head(&mymcasp_resource->tx_wq);
     init_waitqueue_head(&mymcasp_resource->rx_wq);
     mymcasp_resource->clk_enabled = false;
+    mymcasp_resource->hw_users = 0;
+    mymcasp_resource->dev_opened = false;
     mymcasp_resource->i2s_mode = SLAVE;
-    mutex_init(&mymcasp_resource->lock);
+    mymcasp_resource->irq_tx = -1;
+    mymcasp_resource->irq_rx = -1;
+    mutex_init(&mymcasp_resource->tx_lock);
+    mutex_init(&mymcasp_resource->rx_lock);
+    mutex_init(&mymcasp_resource->hw_lock);
 
     // 3. OBTENER RECURSOS y MAPEAR MEMORIA
     res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
     if (!res) {
         pr_err("No se encontró el recurso de memoria en el DT\n");
-        mutex_destroy(&mymcasp_resource->lock);
-        return -ENODEV; // Abortar si no hay memoria
+        status = -ENODEV; // Abortar si no hay memoria
+        goto err_mutex;
     }
 
     mymcasp_resource->instance = devm_ioremap_resource(&(pdev->dev), res);
     if (IS_ERR(mymcasp_resource->instance)) {
         pr_err("%s Error al mapear los recursos de memoria\n", __MODULE_NAME__);
-        mutex_destroy(&mymcasp_resource->lock);
-        return PTR_ERR(mymcasp_resource->instance);
+        status = PTR_ERR(mymcasp_resource->instance);
+        goto err_mutex;
     }
 
     // 4. Leer propiedades del Device Tree.
     if (pdev->dev.of_node) {
         status = of_property_read_u32(pdev->dev.of_node, "utn,frecuencia", &mymcasp_resource->hertz);
-        mymcasp_resource->hertz = 100000; // TODO BORRAR
-        if (status < 0) mymcasp_resource->hertz = 1000;
-
-        status = of_property_read_u32(pdev->dev.of_node, "square_on", &mymcasp_resource->square_on);
-        if (status < 0) mymcasp_resource->square_on = 0;
+        if (status < 0) mymcasp_resource->hertz = FAULT_FREQ;
     } else {
-        mymcasp_resource->hertz = 1000;
-        mymcasp_resource->square_on = 0;
+        mymcasp_resource->hertz = FAULT_FREQ;
     }
+#ifdef FREQ_TEST
+    mymcasp_resource->hertz = FREQ_TEST; // TODO BORRAR
+#endif
 
     // 5. Reservar el número de dispositivo.
     status = alloc_chrdev_region(
@@ -935,8 +1077,7 @@ static int mymcasp_probe(struct platform_device *pdev)
     if (status < 0) {
         pr_err("%s Error al registrar la región del dispositivo: %d\n",
                __MODULE_NAME__, status);
-        mutex_destroy(&mymcasp_resource->lock);
-        return status;
+        goto err_mutex;
     }
 
     // 6. Inicializar y registrar el character device.
@@ -951,9 +1092,7 @@ static int mymcasp_probe(struct platform_device *pdev)
     if (status < 0) {
         pr_err("%s Error al agregar el cdev: %d\n",
                __MODULE_NAME__, status);
-        unregister_chrdev_region(mymcasp_resource->mymcasp_cstm_cdev.mymcasp_dev, CDEV_NBR);
-        mutex_destroy(&mymcasp_resource->lock);
-        return status;
+        goto err_chrdev;
     }
 
     // 7. Crear el device asociado a la clase (/dev/td3_i2s).
@@ -970,10 +1109,7 @@ static int mymcasp_probe(struct platform_device *pdev)
         pr_err("%s Error al crear el dispositivo: %d\n",
                __MODULE_NAME__, status);
         mymcasp_resource->mymcasp_device = NULL;
-        cdev_del(&mymcasp_resource->mymcasp_cstm_cdev.mymcasp_cdev);
-        unregister_chrdev_region(mymcasp_resource->mymcasp_cstm_cdev.mymcasp_dev, CDEV_NBR);
-        mutex_destroy(&mymcasp_resource->lock);
-        return status;
+        goto err_cdev;
     }
 
     // 8. Asociar los datos privados al dispositivo de plataforma.
@@ -982,13 +1118,7 @@ static int mymcasp_probe(struct platform_device *pdev)
     // 9. Registrar las interrupciones de TX y RX del McASP.
     status = init_irq(mymcasp_resource);
     if (status < 0) {
-        platform_set_drvdata(pdev, NULL);
-        device_destroy(&td3_i2s_class, mymcasp_resource->mymcasp_cstm_cdev.mymcasp_dev);
-        mymcasp_resource->mymcasp_device = NULL;
-        cdev_del(&mymcasp_resource->mymcasp_cstm_cdev.mymcasp_cdev);
-        unregister_chrdev_region(mymcasp_resource->mymcasp_cstm_cdev.mymcasp_dev, CDEV_NBR);
-        mutex_destroy(&mymcasp_resource->lock);
-        return status;
+        goto err_device;
     }
 
     // Fix para tener en los metodos de /Sysfs/class/I2S_td3 los datos de la instancia.
@@ -1002,9 +1132,27 @@ static int mymcasp_probe(struct platform_device *pdev)
             MINOR(mymcasp_resource->mymcasp_cstm_cdev.mymcasp_dev));
 
     return 0;
+
+err_device:
+    platform_set_drvdata(pdev, NULL);
+    device_destroy(&td3_i2s_class, mymcasp_resource->mymcasp_cstm_cdev.mymcasp_dev);
+    mymcasp_resource->mymcasp_device = NULL;
+err_cdev:
+    cdev_del(&mymcasp_resource->mymcasp_cstm_cdev.mymcasp_cdev);
+err_chrdev:
+    unregister_chrdev_region(mymcasp_resource->mymcasp_cstm_cdev.mymcasp_dev, CDEV_NBR);
+err_mutex:
+    mutex_destroy(&mymcasp_resource->hw_lock);
+    mutex_destroy(&mymcasp_resource->rx_lock);
+    mutex_destroy(&mymcasp_resource->tx_lock);
+    return status;
 }
 
 
+/**
+ * @brief Desvincula el dispositivo de plataforma McASP, detiene el hardware si seguía
+ *        activo y libera el dispositivo de caracteres, la región y los mutexes.
+ */
 static void mymcasp_remove(struct platform_device *pdev)
 {
     mymcasp_handler_t *mymcasp_resource = platform_get_drvdata(pdev);
@@ -1017,6 +1165,10 @@ static void mymcasp_remove(struct platform_device *pdev)
     g_handler = NULL;
 
     // Si quedó abierto/encendido, detener hardware y apagar el reloj
+    mutex_lock(&mymcasp_resource->hw_lock);
+    if (mymcasp_resource->hw_users > 0)
+        mymcasp_resource->hw_users = 1;
+    mutex_unlock(&mymcasp_resource->hw_lock);
     mymcasp_hw_deinit(mymcasp_resource);
 
     // Destruir el dispositivo asociado a la clase.
@@ -1032,16 +1184,17 @@ static void mymcasp_remove(struct platform_device *pdev)
     // Eliminar la asociación con los datos privados.
     platform_set_drvdata(pdev, NULL);
 
-    // Destruir el mutex luego de desregistrar todas las interfaces.
-    mutex_destroy(&mymcasp_resource->lock);
+    // Destruir los mutexes luego de desregistrar todas las interfaces.
+    mutex_destroy(&mymcasp_resource->hw_lock);
+    mutex_destroy(&mymcasp_resource->rx_lock);
+    mutex_destroy(&mymcasp_resource->tx_lock);
 
     pr_info("%s Dispositivo removido\n", __MODULE_NAME__);
 }
 
-// nombre que aparece en DT.
-// TODO: renombrar a mcasp-device. Se debe hacer en el dtbo.
+// Nombre de match declarado en el Device Tree.
 static const struct of_device_id mymcasp_of_match[] = {
-    { .compatible = "utn,cin-device", },
+    { .compatible = "utn,mcasp-device", },
     { },
 };
 
@@ -1053,13 +1206,18 @@ static struct platform_driver mymcasp_driver = {
     .probe = mymcasp_probe,
     .remove = mymcasp_remove,
     .driver = {
-        .name = "cin_platform_driver",
+        .name = "utn_mcasp_driver",
         .owner = THIS_MODULE,
         .of_match_table = of_match_ptr(mymcasp_of_match),  
     },
 };
 
 
+/**
+ * @brief Función de inicialización del módulo: registra la clase sysfs td3_i2s
+ *        y el platform driver asociado al McASP.
+ * @return 0 en caso de éxito o código de error negativo si falla el registro.
+ */
 static int __init mymcasp_init(void){
     int status;
 
@@ -1083,11 +1241,11 @@ static int __init mymcasp_init(void){
     return 0;
 }
 
+/**
+ * @brief Función de salida del módulo
+ */
 static void __exit mymcasp_exit(void){
-    // Esto provoca remove() para las instancias que sigan asociadas.
     platform_driver_unregister(&mymcasp_driver);
-
-    // Desregistrar la clase cuando ya no quedan dispositivos asociados.
     class_unregister(&td3_i2s_class);
 
     pr_info("%s Modulo sin registrar\n", __MODULE_NAME__);

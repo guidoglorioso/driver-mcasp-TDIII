@@ -52,6 +52,20 @@ bool cb_is_full(circ_buf_t *cb) {
     return full;
 }
 
+bool cb_half_free(circ_buf_t *cb) {
+    unsigned long flags;
+    bool half_free;
+
+    if (!cb)
+        return true;
+
+    spin_lock_irqsave(&cb->lock, flags);
+    half_free = (cb->count <= (BUFF_SIZE / 2));
+    spin_unlock_irqrestore(&cb->lock, flags);
+
+    return half_free;
+}
+
 size_t cb_count(circ_buf_t *cb) {
     unsigned long flags;
     size_t count;

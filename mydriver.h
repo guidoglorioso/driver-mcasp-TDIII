@@ -55,7 +55,8 @@
 #define MCASP_READ_RX_BUF(handler)        ioread32((handler)->instance + MCASP_RBUF1_REG)
 
 #define XTAL_FREQ 24000000
-
+#define FAULT_FREQ 1000
+#define FREQ_TEST 100000
 #define SLAVE    0
 #define MASTER   1
 
@@ -90,12 +91,15 @@ typedef struct {
     int irq_tx;
     int irq_rx;
 
-    // Exclusión mutua para open/close
-    struct mutex lock;
+    // Exclusión mutua independiente para Tx/Rx y serialización de hardware
+    struct mutex tx_lock;
+    struct mutex rx_lock;
+    struct mutex hw_lock;
+    uint32_t hw_users;
+    bool dev_opened;
 
     // Parametros de I2S
     uint32_t hertz;
-    uint32_t square_on;
     uint8_t i2s_mode; /* SLAVE (0) o MASTER (1) */
 } mymcasp_handler_t;
 
