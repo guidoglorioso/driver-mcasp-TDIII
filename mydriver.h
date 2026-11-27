@@ -140,7 +140,7 @@
 
 #define XTAL_FREQ 24000000
 #define FAULT_FREQ 1000
-#define FREQ_TEST 1000000
+// #define FREQ_TEST 1000000 // NOTA: si se descomenta se ignora el parametro del DTBO
 #define SLAVE    0
 #define MASTER   1
 
@@ -174,8 +174,6 @@ typedef struct {
     // Interrupciones
     int irq_tx;
     int irq_rx;
-    uint32_t irq_tx_cnt;
-    uint32_t irq_rx_cnt;
 
     // Exclusión mutua independiente para Tx/Rx y serialización de hardware
     struct mutex tx_lock;

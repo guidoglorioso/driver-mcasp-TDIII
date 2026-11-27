@@ -23,9 +23,6 @@ void mcasp_wait_reg(void __iomem *base, uint32_t reg, uint32_t mask, bool wait_s
 //      Metodos de Buffer Circular
 //-------------------------------------
 
-/// @brief 
-/// @param cb 
-/// @param overwrite 
 void cb_init(circ_buf_t *cb, bool overwrite) {
     if (!cb)
         return;

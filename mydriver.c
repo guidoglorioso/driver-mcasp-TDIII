@@ -7,13 +7,16 @@ MODULE_DESCRIPTION("Driver de MCASP TDIII");
 static const char __MODULE_NAME__[] = "td3_i2s";
 
 static mymcasp_handler_t *g_handler = NULL;
-
+static void mcasp_reg_config(mymcasp_handler_t *handler, bool enable);
+static void mcasp_wfifo_fill(mymcasp_handler_t *handler);
 //-------------------------------------
 //    Configuracion y manejo de IRQ
 //-------------------------------------
 
 /**
- * @brief Habilitacion/Deshabilitacion de interrupcion TX.
+ * @brief Habilita o deshabilita las interrupciones de TX (XSTAFRM y XUNDRN).
+ * @param handler Contexto del driver McASP.
+ * @param enable true para habilitar (limpia XSTAT si estaba deshabilitada); false para deshabilitar.
  */
 static void mcasp_irq_tx_enable(mymcasp_handler_t *handler, bool enable) {
     uint32_t reg_val;
@@ -33,7 +36,9 @@ static void mcasp_irq_tx_enable(mymcasp_handler_t *handler, bool enable) {
 }
 
 /**
- * @brief Habilitacion/Deshabilitacion de interrupcion RX.
+ * @brief Habilita o deshabilita las interrupciones de RX (RSTAFRM y ROVRN).
+ * @param handler Contexto del driver McASP.
+ * @param enable true para drenar RFIFO, limpiar RSTAT y habilitar; false para deshabilitar.
  */
 static void mcasp_irq_rx_enable(mymcasp_handler_t *handler, bool enable) {
     uint32_t reg_val;
@@ -64,26 +69,13 @@ static void mcasp_irq_rx_enable(mymcasp_handler_t *handler, bool enable) {
 }
 
 
-
-static void mcasp_wfifo_fill(mymcasp_handler_t *handler) {
-    uint32_t wlvl;
-
-    /* AFIFO: Leer WLVL en WFIFOSTS y llenar WFIFO por dat_port hasta 64 words */
-    wlvl = ioread32(handler->instance + MCASP_WFIFOSTS_REG) & MCASP_AFIFO_LVL_MASK;
-    if (wlvl > MCASP_AFIFO_DEPTH_WORDS)
-        wlvl = MCASP_AFIFO_DEPTH_WORDS;
-
-    for (; wlvl < MCASP_AFIFO_DEPTH_WORDS; wlvl++)
-        MCASP_WRITE_DAT(handler, cb_pop_word(&handler->tx_buf));
-
-    if (cb_half_free(&handler->tx_buf))
-        wake_up_interruptible(&handler->tx_wq);
-}
-
 //-------------------------------------
 //              Handlers
 //-------------------------------------
 
+/**
+ * @brief ISR de transmisión McASP: limpia XSTAT, rellena WFIFO y recupera underrun (XUNDRN).
+ */
 static irqreturn_t isr_tx_mcasp(int irq, void *dev_id) {
     mymcasp_handler_t *handler = (mymcasp_handler_t *)dev_id;
     uint32_t xstat;
@@ -92,7 +84,6 @@ static irqreturn_t isr_tx_mcasp(int irq, void *dev_id) {
     if (!handler || !handler->instance || !handler->dat_port || !handler->clk_enabled)
         return IRQ_NONE;
 
-    handler->irq_tx_cnt++;
     xstat = ioread32(handler->instance + MCASP_XSTAT_REG);
 
     if (xstat & MCASP_XSTAT_XUNDRN) {
@@ -125,6 +116,9 @@ static irqreturn_t isr_tx_mcasp(int irq, void *dev_id) {
 }
 
 
+/**
+ * @brief ISR de recepción McASP: vacía RFIFO hacia @c rx_buf, despierta @c rx_wq y limpia RSTAT.
+ */
 static irqreturn_t isr_rx_mcasp(int irq, void *dev_id) {
     mymcasp_handler_t *handler = (mymcasp_handler_t *)dev_id;
     uint32_t rstat;
@@ -135,7 +129,6 @@ static irqreturn_t isr_rx_mcasp(int irq, void *dev_id) {
     if (!handler || !handler->instance || !handler->dat_port || !handler->clk_enabled)
         return IRQ_NONE;
 
-    handler->irq_rx_cnt++;
     rstat = ioread32(handler->instance + MCASP_RSTAT_REG);
 
     /* AFIFO: Leer todas las palabras acumuladas en RFIFO (RFIFOSTS.RLVL) desde dat_port */
@@ -168,6 +161,11 @@ static irqreturn_t isr_rx_mcasp(int irq, void *dev_id) {
 //     Rutinas de inicializacion
 //---------------------------------
 
+/**
+ * @brief Obtiene del Device Tree y registra las IRQs de TX y RX del McASP.
+ * @param handler Contexto del driver McASP.
+ * @return 0 en éxito o código de error negativo.
+ */
 static int init_irq(mymcasp_handler_t *handler) {
     int ret;
 
@@ -208,8 +206,13 @@ static int init_irq(mymcasp_handler_t *handler) {
     return 0;
 }
 
-static void mcasp_reg_config(mymcasp_handler_t *handler, bool enable);
 
+/**
+ * @brief Configura el modo I2S (SLAVE/MASTER) y reaplica registros si el reloj está activo.
+ * @param handler Contexto del driver McASP.
+ * @param mode Modo deseado: @c SLAVE (0) o @c MASTER (1).
+ * @return 0 en éxito, -ENODEV o -EINVAL si el parámetro es inválido.
+ */
 static int set_i2s_mode(mymcasp_handler_t *handler, uint8_t mode) {
     if (!handler || !handler->instance)
         return -ENODEV;
@@ -219,7 +222,6 @@ static int set_i2s_mode(mymcasp_handler_t *handler, uint8_t mode) {
 
     handler->i2s_mode = mode;
 
-    // Si el clock ya está encendido, reaplicar la configuración completa del McASP
     if (handler->clk_enabled) {
         mcasp_reg_config(handler, true);
     }
@@ -227,6 +229,11 @@ static int set_i2s_mode(mymcasp_handler_t *handler, uint8_t mode) {
     return 0;
 }
 
+/**
+ * @brief Obtiene y habilita el reloj funcional @c fck del McASP si aún no está encendido.
+ * @param handler Contexto del driver McASP.
+ * @return 0 en éxito o código de error negativo.
+ */
 static int init_clock(mymcasp_handler_t *handler) {
     int ret;
 
@@ -252,6 +259,10 @@ static int init_clock(mymcasp_handler_t *handler) {
     return 0;
 }
 
+/**
+ * @brief Configura los pines del McASP en PFUNC y fija la dirección de AXR0 (TX) y AXR1 (RX).
+ * @param handler Contexto del driver McASP.
+ */
 static void init_gpio(mymcasp_handler_t *handler) {
     uint32_t reg_val;
 
@@ -271,6 +282,12 @@ static void init_gpio(mymcasp_handler_t *handler) {
     iowrite32(reg_val, handler->instance + MCASP_PDIR_REG);
 }
 
+/**
+ * @brief Calcula los divisores AHCLKX y ACLKX para alcanzar la frecuencia de BCLK objetivo.
+ * @param target_freq Frecuencia de bit clock deseada en Hz.
+ * @param ahclk_div Puntero de salida para el campo HCLKXDIV.
+ * @param aclk_div Puntero de salida para el campo CLKXDIV.
+ */
 static void mcasp_calc_clk_divs(uint32_t target_freq, uint32_t *ahclk_div, uint32_t *aclk_div) {
     uint32_t total_div;
 
@@ -299,20 +316,48 @@ static void mcasp_calc_clk_divs(uint32_t target_freq, uint32_t *ahclk_div, uint3
     }
 }
 
-// TODO Revisar registros, hacer clean
-static void mcasp_afifo_flush(mymcasp_handler_t *handler) {
-    /* AFIFO: Poner WENA = 0 y RENA = 0 limpia instantáneamente WFIFO y RFIFO en hardware */
-    iowrite32(ioread32(handler->instance + MCASP_WFIFOCTL_REG) & ~MCASP_WFIFO_WENA,
-              handler->instance + MCASP_WFIFOCTL_REG);
-    iowrite32(ioread32(handler->instance + MCASP_RFIFOCTL_REG) & ~MCASP_RFIFO_RENA,
-              handler->instance + MCASP_RFIFOCTL_REG);
+/**
+ * @brief Rellena la WFIFO por @c dat_port hasta 64 palabras con @c cb_pop_word y despierta @c tx_wq.
+ * @param handler Contexto del driver McASP.
+ */
+static void mcasp_wfifo_fill(mymcasp_handler_t *handler) {
+    uint32_t wlvl;
+
+    /* AFIFO: Leer WLVL en WFIFOSTS y llenar WFIFO por dat_port hasta 64 words */
+    wlvl = ioread32(handler->instance + MCASP_WFIFOSTS_REG) & MCASP_AFIFO_LVL_MASK;
+    if (wlvl > MCASP_AFIFO_DEPTH_WORDS)
+        wlvl = MCASP_AFIFO_DEPTH_WORDS;
+
+    for (; wlvl < MCASP_AFIFO_DEPTH_WORDS; wlvl++)
+        MCASP_WRITE_DAT(handler, cb_pop_word(&handler->tx_buf));
+
+    if (cb_half_free(&handler->tx_buf))
+        wake_up_interruptible(&handler->tx_wq);
 }
 
+
+/**
+ * @brief Deshabilita WENA y RENA para vaciar (flush) inmediatamente las FIFOs de hardware.
+ * @param handler Contexto del driver McASP.
+ */
+static void mcasp_afifo_flush(mymcasp_handler_t *handler) {
+    /* AFIFO: Poner WENA = 0 y RENA = 0 limpia instantáneamente WFIFO y RFIFO en hardware */
+    int ret = ioread32(handler->instance + MCASP_WFIFOCTL_REG);
+    iowrite32( ret & ~MCASP_WFIFO_WENA, handler->instance + MCASP_WFIFOCTL_REG);
+
+    ret = ioread32(handler->instance + MCASP_RFIFOCTL_REG);
+    iowrite32( ret & ~MCASP_RFIFO_RENA,handler->instance + MCASP_RFIFOCTL_REG);
+}
+
+/**
+ * @brief Configura WFIFO/RFIFO (1 serializer, umbral 16 words) y las habilita antes de salir de reset.
+ * @param handler Contexto del driver McASP.
+ */
 static void mcasp_afifo_enable(mymcasp_handler_t *handler) {
     uint32_t wfifo_cfg;
     uint32_t rfifo_cfg;
 
-    /* AFIFO: Paso 1 - Escribir WNUMDMA (1) / WNUMEVT (16 words) con WENA = 0 y RNUMDMA (1) / RNUMEVT (16 words) con RENA = 0 */
+    /* Escribir WNUMDMA (1) / WNUMEVT (16 words) con WENA = 0 y RNUMDMA (1) / RNUMEVT (16 words) con RENA = 0 */
     wfifo_cfg = MCASP_AFIFO_NUMEVT(MCASP_AFIFO_NUMEVT_WORDS) |
                 MCASP_AFIFO_NUMDMA(MCASP_AFIFO_NUMDMA_TX);
     rfifo_cfg = MCASP_AFIFO_NUMEVT(MCASP_AFIFO_NUMEVT_WORDS) |
@@ -321,11 +366,16 @@ static void mcasp_afifo_enable(mymcasp_handler_t *handler) {
     iowrite32(wfifo_cfg, handler->instance + MCASP_WFIFOCTL_REG);
     iowrite32(rfifo_cfg, handler->instance + MCASP_RFIFOCTL_REG);
 
-    /* AFIFO: Paso 2 - En una segunda escritura levantar WENA = 1 y RENA = 1 (con GBLCTL = 0, antes de los pasos 3-9) */
+    /* En una segunda escritura levantar WENA = 1 y RENA = 1 (con GBLCTL = 0, antes de los pasos 3-9) */
     iowrite32(wfifo_cfg | MCASP_WFIFO_WENA, handler->instance + MCASP_WFIFOCTL_REG);
     iowrite32(rfifo_cfg | MCASP_RFIFO_RENA, handler->instance + MCASP_RFIFOCTL_REG);
 }
 
+/**
+ * @brief Configura e inicia el McASP en modo I2S (secuencia 22.3.12.2) o lo detiene por completo.
+ * @param handler Contexto del driver McASP.
+ * @param enable true para inicializar y habilitar TX/RX; false para pasar pines a entrada, GBLCTL=0 y flush AFIFO.
+ */
 static void mcasp_reg_config(mymcasp_handler_t *handler, bool enable){
     uint32_t ahclk_div;
     uint32_t aclk_div;
@@ -351,16 +401,16 @@ static void mcasp_reg_config(mymcasp_handler_t *handler, bool enable){
     // calculo divisores de clocks.
     mcasp_calc_clk_divs(handler->hertz, &ahclk_div, &aclk_div);
 
-    // Paso 1 Transmit/Receive Section Initialization (22.3.12.2)
-    // Resetear McASP a valores por defecto poniendo GBLCTL = 0
+    // NOTA: Para el proceso de inciializacion refererise a "Transmit/Receive Section Initialization (22.3.12.2)"
+
+    // 1 Resetear McASP a valores por defecto poniendo GBLCTL = 0
     iowrite32(0, handler->instance + MCASP_GBLCTL_REG);
     mcasp_wait_reg(handler->instance, MCASP_GBLCTL_REG, MCASP_GBL_TX_MASK | MCASP_GBL_RX_MASK, false);
 
     // AFIFO: Deshabilitar WENA/RENA (flush) antes de reconfigurar el McASP
     mcasp_afifo_flush(handler);
 
-    // Paso 2 Transmit/Receive Section Initialization (22.3.12.2)
-    // Configurar todos los registros del McASP (excepto GBLCTL) en el orden:
+    // 2 Configurar todos los registros del McASP (excepto GBLCTL) en el orden:
     // 2.a PWRIDLESYSCONFIG (gestionado por el clock/PRCM del SoC)
 
     // 2.b Registros de Recepción: RMASK, RFMT, AFSRCTL, ACLKRCTL, RTDM, RINTCTL
@@ -391,7 +441,7 @@ static void mcasp_reg_config(mymcasp_handler_t *handler, bool enable){
     // 2.c Registros de Transmisión: XMASK, XFMT, AFSXCTL, ACLKXCTL, AHCLKXCTL, XTDM, XINTCTL
     iowrite32(0xFFFFFFFF, handler->instance + MCASP_XMASK_REG);
 
-    // XDATDLY = 1 (1 ciclo de retardo - estándar I2S), XRVRS = 1 (MSB primero), XSSZ = 32 bits,
+    // XDATDLY = 1 (1 ciclo de retardo), XRVRS = 1 (MSB primero), XSSZ = 32 bits,
     // AFIFO: XBUSEL = 0 selecciona el Data Port (0x4600_0000) para usar la Write FIFO
     iowrite32(MCASP_FMT_DATDLY(1) | MCASP_FMT_RVRS_MSB | MCASP_FMT_SSZ_32BIT | MCASP_FMT_BUSEL_DAT,
               handler->instance + MCASP_XFMT_REG);
@@ -449,8 +499,7 @@ static void mcasp_reg_config(mymcasp_handler_t *handler, bool enable){
     // AFIFO: Configurar WNUMDMA/WNUMEVT y RNUMDMA/RNUMEVT (16 words) y luego habilitar WENA/RENA con GBLCTL = 0
     mcasp_afifo_enable(handler);
 
-    // Paso 3 Transmit/Receive Section Initialization (22.3.12.2)
-    // Iniciar los relojes serie de alta frecuencia (XHCLKRST y RHCLKRST)
+    // 3 Iniciar los relojes serie de alta frecuencia (XHCLKRST y RHCLKRST)
     xgbl |= MCASP_GBL_XHCLKRST;
     iowrite32(xgbl, handler->instance + MCASP_XGBLCTL_REG);
     mcasp_wait_reg(handler->instance, MCASP_GBLCTL_REG, MCASP_GBL_XHCLKRST, true);
@@ -459,8 +508,7 @@ static void mcasp_reg_config(mymcasp_handler_t *handler, bool enable){
     iowrite32(rgbl, handler->instance + MCASP_RGBLCTL_REG);
     mcasp_wait_reg(handler->instance, MCASP_GBLCTL_REG, MCASP_GBL_RHCLKRST, true);
 
-    // Paso 4 Transmit/Receive Section Initialization (22.3.12.2)
-    // Iniciar los relojes serie (XCLKRST y RCLKRST)
+    // 4 Iniciar los relojes serie (XCLKRST y RCLKRST)
     xgbl |= MCASP_GBL_XCLKRST;
     iowrite32(xgbl, handler->instance + MCASP_XGBLCTL_REG);
     mcasp_wait_reg(handler->instance, MCASP_GBLCTL_REG, MCASP_GBL_XCLKRST, true);
@@ -469,12 +517,10 @@ static void mcasp_reg_config(mymcasp_handler_t *handler, bool enable){
     iowrite32(rgbl, handler->instance + MCASP_RGBLCTL_REG);
     mcasp_wait_reg(handler->instance, MCASP_GBLCTL_REG, MCASP_GBL_RCLKRST, true);
 
-    // Paso 5 Transmit/Receive Section Initialization (22.3.12.2)
-    // Mantener interrupción de recepción (RSTAFRM) deshabilitada hasta read(); TX se habilita en Paso 7
+    // 5 Mantener interrupción de recepción (RSTAFRM) deshabilitada hasta read(); TX se habilita en Paso 7
     mcasp_irq_rx_enable(handler, false);
 
-    // Paso 6 Transmit/Receive Section Initialization (22.3.12.2)
-    // Limpiar XSTAT y RSTAT (FFFFh) y activar serializers (XSRCLR y RSRCLR)
+    // 6 Limpiar XSTAT y RSTAT (FFFFh) y activar serializers (XSRCLR y RSRCLR)
     iowrite32(MCASP_STAT_CLEAR_ALL, handler->instance + MCASP_XSTAT_REG);
     iowrite32(MCASP_STAT_CLEAR_ALL, handler->instance + MCASP_RSTAT_REG);
 
@@ -486,8 +532,7 @@ static void mcasp_reg_config(mymcasp_handler_t *handler, bool enable){
     iowrite32(rgbl, handler->instance + MCASP_RGBLCTL_REG);
     mcasp_wait_reg(handler->instance, MCASP_GBLCTL_REG, MCASP_GBL_RSRCLR, true);
 
-    // Paso 7 Transmit/Receive Section Initialization (22.3.12.2)
-    // AFIFO: Precargar WFIFO con ceros por dat_port antes de soltar XSMRST para arrancar sin Underrun
+    // 7 AFIFO: Precargar WFIFO con ceros por dat_port antes de soltar XSMRST para arrancar sin Underrun
     if (handler->dat_port) {
         uint32_t i;
 
@@ -496,10 +541,10 @@ static void mcasp_reg_config(mymcasp_handler_t *handler, bool enable){
 
         mcasp_wait_reg(handler->instance, MCASP_XSTAT_REG, MCASP_INT_DATA, false);
     }
+
     mcasp_irq_tx_enable(handler, true);
 
-    // Paso 8 Transmit/Receive Section Initialization (22.3.12.2)
-    // Liberar máquinas de estado de reset (XSMRST y RSMRST)
+    // 8 Liberar máquinas de estado de reset (XSMRST y RSMRST)
     xgbl |= MCASP_GBL_XSMRST;
     iowrite32(xgbl, handler->instance + MCASP_XGBLCTL_REG);
     mcasp_wait_reg(handler->instance, MCASP_GBLCTL_REG, MCASP_GBL_XSMRST, true);
@@ -508,8 +553,7 @@ static void mcasp_reg_config(mymcasp_handler_t *handler, bool enable){
     iowrite32(rgbl, handler->instance + MCASP_RGBLCTL_REG);
     mcasp_wait_reg(handler->instance, MCASP_GBLCTL_REG, MCASP_GBL_RSMRST, true);
 
-    // Paso 9 Transmit/Receive Section Initialization (22.3.12.2)
-    // Liberar generadores de Frame Sync de reset (XFRST y RFRST)
+    // 9 Liberar generadores de Frame Sync de reset (XFRST y RFRST)
     xgbl |= MCASP_GBL_XFRST;
     iowrite32(xgbl, handler->instance + MCASP_XGBLCTL_REG);
     mcasp_wait_reg(handler->instance, MCASP_GBLCTL_REG, MCASP_GBL_XFRST, true);
@@ -518,10 +562,13 @@ static void mcasp_reg_config(mymcasp_handler_t *handler, bool enable){
     iowrite32(rgbl, handler->instance + MCASP_RGBLCTL_REG);
     mcasp_wait_reg(handler->instance, MCASP_GBLCTL_REG, MCASP_GBL_RFRST, true);
 
-    // Paso 10 Transmit/Receive Section Initialization (22.3.12.2)
-    // Las transferencias comienzan en el primer flanco de Frame Sync
+    // 10 Las transferencias comienzan en el primer flanco de Frame Sync
 }
 
+/**
+ * @brief Descarta datos pendientes en @c tx_buf al finalizar o abortar una transmisión.
+ * @param handler Contexto del driver McASP.
+ */
 static void mymcasp_tx_stop(mymcasp_handler_t *handler) {
     if (!handler)
         return;
@@ -529,6 +576,10 @@ static void mymcasp_tx_stop(mymcasp_handler_t *handler) {
     cb_reset(&handler->tx_buf);
 }
 
+/**
+ * @brief Decrementa @c hw_users y apaga IRQs, McASP y reloj @c fck cuando no quedan usuarios.
+ * @param handler Contexto del driver McASP.
+ */
 static void mymcasp_hw_deinit(mymcasp_handler_t *handler) {
     if (!handler)
         return;
@@ -552,9 +603,6 @@ static void mymcasp_hw_deinit(mymcasp_handler_t *handler) {
         if (handler->irq_rx >= 0)
             synchronize_irq(handler->irq_rx);
 
-        pr_info("%s IRQ count -> TX: %u | RX: %u\n",
-                __MODULE_NAME__, handler->irq_tx_cnt, handler->irq_rx_cnt);
-
         // 3. Poner GBLCTL = 0 y pines de reloj en entrada
         if (handler->instance) {
             mcasp_reg_config(handler, false);
@@ -574,6 +622,11 @@ static void mymcasp_hw_deinit(mymcasp_handler_t *handler) {
     mutex_unlock(&handler->hw_lock);
 }
 
+/**
+ * @brief Incrementa @c hw_users y, si es el primer usuario, enciende @c fck e inicializa el McASP.
+ * @param handler Contexto del driver McASP.
+ * @return 0 en éxito o código de error negativo.
+ */
 static int mymcasp_hw_init(mymcasp_handler_t *handler) {
     int status = 0;
 
@@ -590,11 +643,9 @@ static int mymcasp_hw_init(mymcasp_handler_t *handler) {
             return status;
         }
 
-        // Resetear índices de los buffers circulares y contadores IRQ antes de habilitar el McASP
+        // Resetear índices de los buffers circulares antes de habilitar el McASP
         cb_reset(&handler->tx_buf);
         cb_reset(&handler->rx_buf);
-        handler->irq_tx_cnt = 0;
-        handler->irq_rx_cnt = 0;
 
         // Inicializa el McASP siguiendo la secuencia 22.3.12.2 (Pasos 1 a 10)
         mcasp_reg_config(handler, true);
@@ -607,9 +658,9 @@ static int mymcasp_hw_init(mymcasp_handler_t *handler) {
 }
 
 
-/////////////////////////
+//----------------------------------------
 // Interfaz Sysfs - (/sys/class/td3_i2s/)
-/////////////////////////
+//----------------------------------------
 
 /**
  * @brief Lee el modo de operación I2S actual (`0` = Slave, `1` = Master) en `buf`.
@@ -1083,7 +1134,8 @@ static struct file_operations mymcasp_fops = {
 /////////////////////////
 
 /**
- * @brief Inicializa el dispositivo de plataforma McASP.
+ * @brief Registra el dispositivo de plataforma McASP: mapea regiones @c mpu y @c dat,
+ *        lee el Device Tree y crea `/dev/td3_i2s` junto con sus IRQs.
  */
 static int mymcasp_probe(struct platform_device *pdev)
 {
@@ -1305,7 +1357,6 @@ static struct platform_driver mymcasp_driver = {
 /**
  * @brief Función de inicialización del módulo: registra la clase sysfs td3_i2s
  *        y el platform driver asociado al McASP.
- * @return 0 en caso de éxito o código de error negativo si falla el registro.
  */
 static int __init mymcasp_init(void){
     int status;
@@ -1331,7 +1382,7 @@ static int __init mymcasp_init(void){
 }
 
 /**
- * @brief Función de salida del módulo
+ * @brief Desregistra el platform driver y la clase sysfs @c td3_i2s al descargar el módulo.
  */
 static void __exit mymcasp_exit(void){
     platform_driver_unregister(&mymcasp_driver);
