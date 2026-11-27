@@ -11,7 +11,6 @@
 #include <linux/uaccess.h> 
 #include <linux/slab.h>    
 #include <linux/device.h>  
-#include <linux/clk.h>
 #include <linux/delay.h>
 #include <linux/io.h>
 #include <linux/mutex.h>
@@ -25,6 +24,27 @@
 #define CDEV_NBR 1
 #define CDEV_MINORBASE 0
 
+/* PRCM - Clock Module Peripheral (CM_PER) para gestión directa de clock McASP0 */
+#define CM_PER_BASE               0x44E00000U
+#define CM_PER_SIZE               0x400U
+#define CM_PER_MCASP0_CLKCTRL_REG 0x34U
+#define CM_CLKCTRL_MODULEMODE_MASK    0x3U
+#define CM_CLKCTRL_MODULEMODE_DISABLE 0x0U
+#define CM_CLKCTRL_MODULEMODE_ENABLE  0x2U
+#define CM_CLKCTRL_IDLEST_MASK        (0x3U << 16)
+
+/* Control Module - Registros de Pinmux para McASP0 (AM335x) */
+#define CTRL_MODULE_BASE           0x44E10000U
+#define CTRL_MODULE_SIZE           0x1000U
+#define CTRL_CONF_MCASP0_ACLKX_REG 0x990U /* P9_31 */
+#define CTRL_CONF_MCASP0_FSX_REG   0x994U /* P9_29 */
+#define CTRL_CONF_MCASP0_AXR0_REG  0x998U /* P9_30 */
+#define CTRL_CONF_MCASP0_AXR1_REG  0x9A8U /* P9_41 */
+#define CTRL_PAD_MODE_0            0x0U
+#define CTRL_PAD_PUDEN             (1U << 3) /* Pull-up/down deshabilitado */
+#define CTRL_PAD_RXACTIVE          (1U << 5) /* Receptor de entrada activo */
+
+#define MCASP_PWRIDLESYSCONFIG_REG 0x04 /* Power Idle SYSCONFIG Register */
 #define MCASP_PFUNC_REG 0x10    /* Pin Function Register (0: McASP, 1: GPIO) */ 
 #define MCASP_PDIR_REG 0x14     /* Pin Direction Register (0: Input, 1: Output) */ 
 #define MCASP_GBLCTL_REG 0x44   /* Global Control Register */ 
@@ -60,6 +80,12 @@
 #define MCASP_INTCTL_STAFRM (1U << 7) /* Bit 7 de XINTCTL/RINTCTL: XSTAFRM / RSTAFRM */
 #define MCASP_STAT_STAFRM   (1U << 6) /* Bit 6 de XSTAT/RSTAT: XSTAFRM / RSTAFRM */
 #define MCASP_INT_DATA      (1U << 5) /* Bit 5 de XINTCTL/XSTAT: XDATA / RDATA */
+
+/* Bits de PWRIDLESYSCONFIG (Gestión de energía / Idle del módulo McASP) */
+#define MCASP_SYSCONFIG_IDLEMODE_MASK 0x3U
+#define MCASP_SYSCONFIG_FORCE_IDLE    0x0U
+#define MCASP_SYSCONFIG_NO_IDLE       0x1U
+#define MCASP_SYSCONFIG_SMART_IDLE    0x2U
 
 /* Bits de PFUNC / PDIR */
 #define MCASP_PIN_AXR0        (1U << 0)
@@ -165,10 +191,12 @@ typedef struct {
     wait_queue_head_t tx_wq;
     wait_queue_head_t rx_wq;
 
-    // Memoria de I2s y Clk
+    // Regiones MMIO (McASP CFG, Data Port, PRCM CM_PER y Control Module)
     void __iomem *instance;
     void __iomem *dat_port;
-    struct clk *fck;
+    void __iomem *cm_per;
+    void __iomem *ctrl_mod;
+    uint32_t orig_clkctrl;
     bool clk_enabled;
 
     // Interrupciones

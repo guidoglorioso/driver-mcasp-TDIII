@@ -2,13 +2,13 @@
 
 ## 1. Descripción general del Trabajo Práctico
 
-Este proyecto implementa un **driver de Linux en espacio de kernel** (`td3_i2s.ko`) para el controlador **McASP0** (*Multichannel Audio Serial Port*) del SoC **TI AM335x** en modo **I2S full-duplex**, operando mediante acceso directo a memoria del periférico (sin utilizar el subsistema ALSA).
+Este proyecto implementa un **driver de Linux en espacio de kernel** (`td3_i2s.ko`) para el controlador **McASP0** (*Multichannel Audio Serial Port*) del SoC **TI AM335x** en modo **I2S full-duplex**, gestionando de forma directa por memoria mapeada toda la cadena de hardware (reloj en PRCM, pinmux en Control Module, modos de energía/idle y registros del McASP/AFIFO, sin utilizar subsistemas de plataforma como `clk`, `pinctrl`, runtime PM ni ALSA).
 
 ### Parámetros de funcionamiento I2S
 - **Formato**: 2 canales/slots I2S, palabras de **32 bits**, **MSB primero** y retardo de **1 ciclo** respecto al Frame Sync.
 - **Sincronismo**: transmisión y recepción síncronas compartiendo bit clock y frame sync, TX en flanco ascendente y RX en flanco descendente.
 - **Estado inicial**: arranca por defecto en modo **SLAVE** (líneas de reloj y frame sync en alta impedancia como entradas) por seguridad eléctrica entre placas.
-- **Gestión de energía y bloqueo**: manejo de reloj bajo demanda (`clk_prepare_enable` / `clk_disable_unprepare`), E/S dirigida por interrupciones y esperas pasivas bloqueantes en `TASK_INTERRUPTIBLE`.
+- **Gestión de energía y bloqueo**: encendido/apagado directo del reloj del periférico bajo demanda, configuración explícita de modo *No-Idle*/*Smart-Idle*, E/S dirigida por interrupciones y esperas pasivas bloqueantes en `TASK_INTERRUPTIBLE`.
 
 ### Uso de AFIFOs de Hardware
 Para alcanzar frecuencias elevadas sin pérdida de tramas, el driver utiliza las **AFIFOs** (*Audio FIFOs*) integradas en el McASP0 junto con su puerto de datos:
@@ -72,14 +72,14 @@ Las variables por defecto en [Makefile](file:////wsl.localhost/Ubuntu/home/guido
 
 ## 4. Mapeo de pines y conexiones físicas (McASP0)
 
-En el controlador `pinctrl-single` del kernel `6.12.100-bone70`, el receptor del pad (`0x20` = *RX Active*) debe permanecer habilitado en `ACLKX` y `AFSX` incluso en modo `MASTER`, ya que el McASP realimenta su propio reloj desde el pin físico.
+El multiplexado de pines se realiza directamente desde el driver sobre el **Control Module** del AM335x (sin depender de `pinctrl-single` en el Device Tree). El receptor del pad (`0x20` = *RX Active*) debe permanecer habilitado en `mcasp0_aclkx` y `mcasp0_fsx` incluso en modo `MASTER`, ya que el McASP realimenta su propio reloj desde el pin físico.
 
-| Función I2S | Pin Físico BBB | Señal AM335x | Offset Control Module | Config DT (`<offset conf mux>`) | Bit en `PFUNC` / `PDIR` | Dirección en Master | Dirección en Slave |
+| Función I2S | Pin Físico BBB | Señal AM335x | Offset Control Module | Config Pad (Mode 0) | Bit en `PFUNC` / `PDIR` | Dirección en Master | Dirección en Slave |
 | :--- | :---: | :--- | :---: | :---: | :---: | :---: | :---: |
-| **BCLK (CLK)** | **P9_31** | `mcasp0_aclkx` | `0x190` (`0x44e10990`) | `0x190 0x28 0x00` (Mode 0) | Bit `26` | Salida (`1`) | Entrada (`0`) |
-| **WS / FS** | **P9_29** | `mcasp0_fsx` | `0x194` (`0x44e10994`) | `0x194 0x28 0x00` (Mode 0) | Bit `28` | Salida (`1`) | Entrada (`0`) |
-| **DATA_TX** | **P9_30** | `mcasp0_axr0` | `0x198` (`0x44e10998`) | `0x198 0x08 0x00` (Mode 0) | Bit `0` | Salida (`1`) | Salida (`1`) |
-| **DATA_RX** | **P9_41** | `mcasp0_axr1` | `0x1a8` (`0x44e109a8`) | `0x1a8 0x28 0x00` (Mode 0) | Bit `1` | Entrada (`0`) | Entrada (`0`) |
+| **BCLK (CLK)** | **P9_31** | `mcasp0_aclkx` | `0x990` (`0x44e10990`) | `0x28` (RX Active, Pull Off) | Bit `26` | Salida (`1`) | Entrada (`0`) |
+| **WS / FS** | **P9_29** | `mcasp0_fsx` | `0x994` (`0x44e10994`) | `0x28` (RX Active, Pull Off) | Bit `28` | Salida (`1`) | Entrada (`0`) |
+| **DATA_TX** | **P9_30** | `mcasp0_axr0` | `0x998` (`0x44e10998`) | `0x08` (Output, Pull Off) | Bit `0` | Salida (`1`) | Salida (`1`) |
+| **DATA_RX** | **P9_41** | `mcasp0_axr1` | `0x9a8` (`0x44e109a8`) | `0x28` (RX Active, Pull Off) | Bit `1` | Entrada (`0`) | Entrada (`0`) |
 
 ### Topologías de conexión
 - **Entre dos placas (Master $\leftrightarrow$ Slave)** *(usar resistores serie de 220 $\Omega$ a 330 $\Omega$ para proteger ante colisión de dos Masters)*:

@@ -230,33 +230,77 @@ static int set_i2s_mode(mymcasp_handler_t *handler, uint8_t mode) {
 }
 
 /**
- * @brief Obtiene y habilita el reloj funcional @c fck del McASP si aún no está encendido.
+ * @brief Habilita o deshabilita directamente el reloj de McASP0 en el PRCM (CM_PER_MCASP0_CLKCTRL).
  * @param handler Contexto del driver McASP.
- * @return 0 en éxito o código de error negativo.
+ * @param enable true para encender (MODULEMODE=ENABLE y esperar IDLEST=0); false para apagar (MODULEMODE=DISABLE).
+ * @return 0 en éxito, -ENODEV si falta mapeo o -ETIMEDOUT si el módulo no sale de idle.
  */
-static int init_clock(mymcasp_handler_t *handler) {
-    int ret;
+static int mcasp_clock_enable(mymcasp_handler_t *handler, bool enable) {
+    uint32_t reg_val;
 
-    if (!handler->fck) {
-        handler->fck = devm_clk_get(&handler->pdev->dev, "fck");
-        if (IS_ERR(handler->fck)) {
-            ret = PTR_ERR(handler->fck);
-            pr_err("No se pudo obtener el reloj fck: %d\n", ret);
-            handler->fck = NULL;
-            return ret;
-        }
-    }
+    if (!handler || !handler->cm_per)
+        return -ENODEV;
 
-    if (!handler->clk_enabled) {
-        ret = clk_prepare_enable(handler->fck);
-        if (ret) {
-            pr_err("Error al habilitar el reloj fck: %d\n", ret);
-            return ret;
+    reg_val = ioread32(handler->cm_per + CM_PER_MCASP0_CLKCTRL_REG);
+    reg_val &= ~CM_CLKCTRL_MODULEMODE_MASK;
+
+    if (enable) {
+        if (!handler->clk_enabled) {
+            reg_val |= CM_CLKCTRL_MODULEMODE_ENABLE;
+            iowrite32(reg_val, handler->cm_per + CM_PER_MCASP0_CLKCTRL_REG);
+
+            mcasp_wait_reg(handler->cm_per, CM_PER_MCASP0_CLKCTRL_REG, CM_CLKCTRL_IDLEST_MASK, false);
+            if ((ioread32(handler->cm_per + CM_PER_MCASP0_CLKCTRL_REG) & CM_CLKCTRL_IDLEST_MASK) != 0) {
+                pr_err("%s Timeout al habilitar CM_PER_MCASP0_CLKCTRL\n", __MODULE_NAME__);
+                return -ETIMEDOUT;
+            }
+            handler->clk_enabled = true;
         }
-        handler->clk_enabled = true;
+    } else {
+        reg_val |= CM_CLKCTRL_MODULEMODE_DISABLE;
+        iowrite32(reg_val, handler->cm_per + CM_PER_MCASP0_CLKCTRL_REG);
+        handler->clk_enabled = false;
     }
 
     return 0;
+}
+
+/**
+ * @brief Restaura el estado previo de CM_PER_MCASP0_CLKCTRL al desregistrar el dispositivo
+ *        para evitar fallos de bus OCP en el interconnect del SoC (ti-sysc).
+ * @param handler Contexto del driver McASP.
+ */
+static void mcasp_restore_orig_clk(mymcasp_handler_t *handler) {
+    if (!handler || !handler->cm_per)
+        return;
+
+    if ((handler->orig_clkctrl & CM_CLKCTRL_MODULEMODE_MASK) == CM_CLKCTRL_MODULEMODE_ENABLE)
+        (void)mcasp_clock_enable(handler, true);
+}
+
+/**
+ * @brief Configura directamente el Pinmux de McASP0 en el Control Module del AM335x.
+ * @param handler Contexto del driver McASP.
+ */
+static void mcasp_pinmux_init(mymcasp_handler_t *handler) {
+    if (!handler || !handler->ctrl_mod)
+        return;
+
+    /* P9_31: mcasp0_aclkx (Mode 0, Pull deshabilitado, RX activo para realimentación/slave) */
+    iowrite32(CTRL_PAD_RXACTIVE | CTRL_PAD_PUDEN | CTRL_PAD_MODE_0,
+              handler->ctrl_mod + CTRL_CONF_MCASP0_ACLKX_REG);
+
+    /* P9_29: mcasp0_fsx (Mode 0, Pull deshabilitado, RX activo para realimentación/slave) */
+    iowrite32(CTRL_PAD_RXACTIVE | CTRL_PAD_PUDEN | CTRL_PAD_MODE_0,
+              handler->ctrl_mod + CTRL_CONF_MCASP0_FSX_REG);
+
+    /* P9_30: mcasp0_axr0 - TX (Mode 0, Pull deshabilitado, solo salida) */
+    iowrite32(CTRL_PAD_PUDEN | CTRL_PAD_MODE_0,
+              handler->ctrl_mod + CTRL_CONF_MCASP0_AXR0_REG);
+
+    /* P9_41: mcasp0_axr1 - RX (Mode 0, Pull deshabilitado, RX activo) */
+    iowrite32(CTRL_PAD_RXACTIVE | CTRL_PAD_PUDEN | CTRL_PAD_MODE_0,
+              handler->ctrl_mod + CTRL_CONF_MCASP0_AXR1_REG);
 }
 
 /**
@@ -395,6 +439,11 @@ static void mcasp_reg_config(mymcasp_handler_t *handler, bool enable){
 
         // AFIFO: Deshabilitar WENA/RENA para hacer flush limpio de las FIFOs de HW al cerrar
         mcasp_afifo_flush(handler);
+
+        // Power Mode: pasar PWRIDLESYSCONFIG a Smart-Idle antes de apagar el reloj del módulo
+        reg_val = ioread32(handler->instance + MCASP_PWRIDLESYSCONFIG_REG);
+        reg_val = (reg_val & ~MCASP_SYSCONFIG_IDLEMODE_MASK) | MCASP_SYSCONFIG_SMART_IDLE;
+        iowrite32(reg_val, handler->instance + MCASP_PWRIDLESYSCONFIG_REG);
         return;
     }
     
@@ -411,7 +460,10 @@ static void mcasp_reg_config(mymcasp_handler_t *handler, bool enable){
     mcasp_afifo_flush(handler);
 
     // 2 Configurar todos los registros del McASP (excepto GBLCTL) en el orden:
-    // 2.a PWRIDLESYSCONFIG (gestionado por el clock/PRCM del SoC)
+    // 2.a PWRIDLESYSCONFIG: fijar No-Idle para evitar que el módulo entre en reposo durante transferencias
+    reg_val = ioread32(handler->instance + MCASP_PWRIDLESYSCONFIG_REG);
+    reg_val = (reg_val & ~MCASP_SYSCONFIG_IDLEMODE_MASK) | MCASP_SYSCONFIG_NO_IDLE;
+    iowrite32(reg_val, handler->instance + MCASP_PWRIDLESYSCONFIG_REG);
 
     // 2.b Registros de Recepción: RMASK, RFMT, AFSRCTL, ACLKRCTL, RTDM, RINTCTL
     iowrite32(0xFFFFFFFF, handler->instance + MCASP_RMASK_REG);
@@ -615,15 +667,14 @@ static void mymcasp_hw_deinit(mymcasp_handler_t *handler) {
         cb_reset(&handler->tx_buf);
         cb_reset(&handler->rx_buf);
 
-        // 5. Apagar el clock funcional del periférico
-        if (handler->fck)
-            clk_disable_unprepare(handler->fck);
+        // 5. Apagar directamente el clock del McASP0 en CM_PER_MCASP0_CLKCTRL
+        (void)mcasp_clock_enable(handler, false);
     }
     mutex_unlock(&handler->hw_lock);
 }
 
 /**
- * @brief Incrementa @c hw_users y, si es el primer usuario, enciende @c fck e inicializa el McASP.
+ * @brief Incrementa @c hw_users y, si es el primer usuario, enciende el clock en PRCM e inicializa el McASP.
  * @param handler Contexto del driver McASP.
  * @return 0 en éxito o código de error negativo.
  */
@@ -636,8 +687,8 @@ static int mymcasp_hw_init(mymcasp_handler_t *handler) {
     mutex_lock(&handler->hw_lock);
 
     if (handler->hw_users == 0) {
-        // Clock Gating
-        status = init_clock(handler);
+        // Clock Gating directo sobre CM_PER_MCASP0_CLKCTRL
+        status = mcasp_clock_enable(handler, true);
         if (status){
             mutex_unlock(&handler->hw_lock);
             return status;
@@ -1197,6 +1248,26 @@ static int mymcasp_probe(struct platform_device *pdev)
         goto err_mutex;
     }
 
+    // Mapear directamente CM_PER (PRCM) y Control Module (Pinmux) sin servicios del kernel
+    mymcasp_resource->cm_per = devm_ioremap(&pdev->dev, CM_PER_BASE, CM_PER_SIZE);
+    if (!mymcasp_resource->cm_per) {
+        pr_err("%s Error al mapear CM_PER\n", __MODULE_NAME__);
+        status = -ENOMEM;
+        goto err_mutex;
+    }
+
+    mymcasp_resource->ctrl_mod = devm_ioremap(&pdev->dev, CTRL_MODULE_BASE, CTRL_MODULE_SIZE);
+    if (!mymcasp_resource->ctrl_mod) {
+        pr_err("%s Error al mapear Control Module\n", __MODULE_NAME__);
+        status = -ENOMEM;
+        goto err_mutex;
+    }
+
+    // Configurar Pinmux directamente en el Control Module y dejar el clock apagado en reposo
+    mcasp_pinmux_init(mymcasp_resource);
+    mymcasp_resource->orig_clkctrl = ioread32(mymcasp_resource->cm_per + CM_PER_MCASP0_CLKCTRL_REG);
+    (void)mcasp_clock_enable(mymcasp_resource, false);
+
     // 4. Leer propiedades del Device Tree.
     if (pdev->dev.of_node) {
         status = of_property_read_u32(pdev->dev.of_node, "utn,frecuencia", &mymcasp_resource->hertz);
@@ -1283,6 +1354,7 @@ err_cdev:
 err_chrdev:
     unregister_chrdev_region(mymcasp_resource->mymcasp_cstm_cdev.mymcasp_dev, CDEV_NBR);
 err_mutex:
+    mcasp_restore_orig_clk(mymcasp_resource);
     mutex_destroy(&mymcasp_resource->hw_lock);
     mutex_destroy(&mymcasp_resource->rx_lock);
     mutex_destroy(&mymcasp_resource->tx_lock);
@@ -1311,6 +1383,9 @@ static void mymcasp_remove(struct platform_device *pdev)
         mymcasp_resource->hw_users = 1;
     mutex_unlock(&mymcasp_resource->hw_lock);
     mymcasp_hw_deinit(mymcasp_resource);
+
+    // Restaurar estado previo del clock antes de devolver el dispositivo al bus (ti-sysc)
+    mcasp_restore_orig_clk(mymcasp_resource);
 
     // Destruir el dispositivo asociado a la clase.
     device_destroy(&td3_i2s_class, mymcasp_resource->mymcasp_cstm_cdev.mymcasp_dev);
