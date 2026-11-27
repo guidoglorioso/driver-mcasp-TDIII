@@ -33,7 +33,7 @@ Driver-BBB/
 ├── Makefile                 # Compilación cruzada del módulo, limpieza y deploy por scp
 ├── README.md                # Documentación principal de uso, entorno y pruebas
 ├── docs.md                  # Notas técnicas de hardware, pines y registros del McASP0
-├── mydriver.c / mydriver.h  # Implementación principal del driver (platform, cdev, sysfs, IRQ, McASP/AFIFO)
+├── i2s_driver.c / i2s_driver.h  # Implementación principal del driver (platform, cdev, sysfs, IRQ, McASP/AFIFO)
 ├── utils.c / utils.h        # Buffer circular thread/IRQ-safe y helper de espera de registros (mcasp_wait_reg)
 ├── dt/                      # Device Tree del overlay y dump del DT de la BBB
 │   ├── device_tree_overlay.dts
@@ -54,7 +54,7 @@ Las variables por defecto en [Makefile](file:////wsl.localhost/Ubuntu/home/guido
   ```bash
   make
   ```
-  Compila `mydriver.o` y `utils.o`, genera `td3_i2s.ko` contra `KDIR` y mueve todos los archivos intermedios y el `.ko` dentro de `obj/`.
+  Compila `i2s_driver.o` y `utils.o`, genera `td3_i2s.ko` contra `KDIR` y mueve todos los archivos intermedios y el `.ko` dentro de `obj/`.
 - **Limpiar archivos generados**:
   ```bash
   make clean
@@ -66,7 +66,7 @@ Las variables por defecto en [Makefile](file:////wsl.localhost/Ubuntu/home/guido
   ```
   Copia `obj/td3_i2s.ko` a `debian@192.168.7.2:/home/debian/` mediante `scp`.
 
-> **Nota sobre bitrate de compilación**: en `mydriver.h` se encuentra la macro `#define FREQ_TEST 1000000` (actualmente en `1 Mbps`). Si se desea tomar la frecuencia directamente desde el Device Tree (`utn,frecuencia = <1000000>` en `dt/device_tree_overlay.dts`), basta con comentar dicha macro y recompilar con `make`.
+> **Nota sobre bitrate de compilación**: en `i2s_driver.h` se encuentra la macro `#define FREQ_TEST 1000000` (actualmente en `1 Mbps`). Si se desea tomar la frecuencia directamente desde el Device Tree (`utn,frecuencia = <1000000>` en `dt/device_tree_overlay.dts`), basta con comentar dicha macro y recompilar con `make`.
 
 ---
 
@@ -126,7 +126,7 @@ dtb_overlay=/boot/dtbs/6.12.100-bone70/device_tree_overlay.dtbo
 
 ### A. Dispositivo de caracteres: `/dev/td3_i2s` (permisos `0666`)
 
-| Operación | Función en `mydriver.c` | Comportamiento |
+| Operación | Función en `i2s_driver.c` | Comportamiento |
 | :--- | :--- | :--- |
 | **`open()`** | `mymcasp_open` | Apertura exclusiva: retorna `-EBUSY` si el nodo ya está abierto o si sysfs tiene una operación TX/RX en curso. Enciende el reloj e inicializa el periférico y las AFIFOs. |
 | **`release()`** | `mymcasp_close` | Si no está saliendo por señal y quedan datos por transmitir, espera hasta 2 s su vaciado; luego detiene el periférico, vacía las FIFOs de hardware, apaga el reloj y libera la exclusividad. |
@@ -135,7 +135,7 @@ dtb_overlay=/boot/dtbs/6.12.100-bone70/device_tree_overlay.dtbo
 
 ### B. Interfaz Sysfs: `/sys/class/td3_i2s/`
 
-| Atributo | Permisos | Función en `mydriver.c` | Comportamiento |
+| Atributo | Permisos | Función en `i2s_driver.c` | Comportamiento |
 | :--- | :---: | :--- | :--- |
 | **`master`** | `0644` (R/W) | `master_show` / `master_store` | Lee (`0` o `1`) o configura el modo I2S aceptando `"0"`/`"SLAVE"`/`"ESCLAVO"` o `"1"`/`"MASTER"`/`"MAESTRO"` (`-EINVAL` para otros valores). Retorna `-EBUSY` si `/dev/td3_i2s` está abierto o hay TX/RX activas. |
 | **`recibir`** | `0444` (R/O bin) | `recibir_read` | Enciende el hardware bajo demanda, habilita la interrupción de RX, bloquea en `TASK_INTERRUPTIBLE` hasta leer `min(count, BUFF_SIZE)` bytes (offset `0`) y apaga el hardware al finalizar. Retorna `-EBUSY` si `/dev/td3_i2s` u otra lectura están en uso. |

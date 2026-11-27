@@ -1,5 +1,5 @@
-#ifndef _CIN_DRIVER_H_
-#define _CIN_DRIVER_H_
+#ifndef _I2S_DRIVER_H_
+#define _I2S_DRIVER_H_
 
 #include <linux/init.h>
 #include <linux/module.h>
@@ -187,4 +187,4 @@ typedef struct {
     uint8_t i2s_mode; /* SLAVE (0) o MASTER (1) */
 } mymcasp_handler_t;
 
-#endif /* _CIN_DRIVER_H_ */
+#endif /* _I2S_DRIVER_H_ */

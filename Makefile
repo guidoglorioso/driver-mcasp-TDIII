@@ -10,7 +10,7 @@ OUTPUT_DIR ?= $(PWD)/obj
 ccflags-y += -I$(PWD)
 
 obj-m := $(MODULE_NAME).o
-$(MODULE_NAME)-objs := mydriver.o utils.o
+$(MODULE_NAME)-objs := i2s_driver.o utils.o
 
 all:
 	@mkdir -p $(OUTPUT_DIR)

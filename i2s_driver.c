@@ -1,4 +1,4 @@
-#include "mydriver.h"
+#include "i2s_driver.h"
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Guido Glorioso");
