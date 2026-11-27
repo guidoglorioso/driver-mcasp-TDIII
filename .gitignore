@@ -1,2 +1,22 @@
-obj/*
-.vscode/*
+# Salida de compilación del Makefile
+obj/
+
+# Artefactos de compilación del kernel (kbuild)
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+.*.cmd
+.module-common.o
+.tmp_versions/
+Module.symvers
+modules.order
+
+# Device Tree compilado y binario de diagnóstico local
+dt/*.dtbo
+test/loopback
+
+# Archivos de editor / entorno local
+.vscode/
+entorno*
