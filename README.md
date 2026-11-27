@@ -5,12 +5,14 @@
 Este proyecto implementa un **driver de Linux en espacio de kernel** (`td3_i2s.ko`) para el controlador **McASP0** (*Multichannel Audio Serial Port*) del SoC **TI AM335x** en modo **I2S full-duplex**, gestionando de forma directa por memoria mapeada toda la cadena de hardware (reloj en PRCM, pinmux en Control Module, modos de energía/idle y registros del McASP/AFIFO, sin utilizar subsistemas de plataforma como `clk`, `pinctrl`, runtime PM ni ALSA).
 
 ### Parámetros de funcionamiento I2S
+
 - **Formato**: 2 canales/slots I2S, palabras de **32 bits**, **MSB primero** y retardo de **1 ciclo** respecto al Frame Sync.
 - **Sincronismo**: transmisión y recepción síncronas compartiendo bit clock y frame sync, TX en flanco ascendente y RX en flanco descendente.
 - **Estado inicial**: arranca por defecto en modo **SLAVE** (líneas de reloj y frame sync en alta impedancia como entradas) por seguridad eléctrica entre placas.
 - **Gestión de energía y bloqueo**: encendido/apagado directo del reloj del periférico bajo demanda, configuración explícita de modo *No-Idle*/*Smart-Idle*, E/S dirigida por interrupciones y esperas pasivas bloqueantes en `TASK_INTERRUPTIBLE`.
 
 ### Uso de AFIFOs de Hardware
+
 Para alcanzar frecuencias elevadas sin pérdida de tramas, el driver utiliza las **AFIFOs** (*Audio FIFOs*) integradas en el McASP0 junto con su puerto de datos:
 
 - **Problema observado sin AFIFO**: operando directamente contra los buffers simples de transmisión/recepción, el hardware dispone únicamente de **1 palabra (32 bits)** de margen. A `1 Mbps`, cada palabra debe ser atendida en `32 µs`; ante latencias normales del kernel Linux en un único núcleo Cortex-A8 (atención de otras IRQs, consola serie o planificación de tareas), se producían *underruns* en TX y *overruns* en RX, limitando la frecuencia máxima estable a **100 kbps** (`100 kHz`).
@@ -54,16 +56,19 @@ Las variables por defecto en [Makefile](file:////wsl.localhost/Ubuntu/home/guido
   ```bash
   make
   ```
+
   Compila `i2s_driver.o` y `utils.o`, genera `td3_i2s.ko` contra `KDIR` y mueve todos los archivos intermedios y el `.ko` dentro de `obj/`.
 - **Limpiar archivos generados**:
   ```bash
   make clean
   ```
+
   Ejecuta `clean` de kbuild y elimina la carpeta `obj/`.
 - **Enviar el `.ko` a la BeagleBone Black**:
   ```bash
   make deploy
   ```
+
   Copia `obj/td3_i2s.ko` a `debian@192.168.7.2:/home/debian/` mediante `scp`.
 
 > **Nota sobre bitrate de compilación**: en `i2s_driver.h` se encuentra la macro `#define FREQ_TEST 1000000` (actualmente en `1 Mbps`). Si se desea tomar la frecuencia directamente desde el Device Tree (`utn,frecuencia = <1000000>` en `dt/device_tree_overlay.dts`), basta con comentar dicha macro y recompilar con `make`.
@@ -74,14 +79,15 @@ Las variables por defecto en [Makefile](file:////wsl.localhost/Ubuntu/home/guido
 
 El multiplexado de pines se realiza directamente desde el driver sobre el **Control Module** del AM335x (sin depender de `pinctrl-single` en el Device Tree). El receptor del pad (`0x20` = *RX Active*) debe permanecer habilitado en `mcasp0_aclkx` y `mcasp0_fsx` incluso en modo `MASTER`, ya que el McASP realimenta su propio reloj desde el pin físico.
 
-| Función I2S | Pin Físico BBB | Señal AM335x | Offset Control Module | Config Pad (Mode 0) | Bit en `PFUNC` / `PDIR` | Dirección en Master | Dirección en Slave |
-| :--- | :---: | :--- | :---: | :---: | :---: | :---: | :---: |
-| **BCLK (CLK)** | **P9_31** | `mcasp0_aclkx` | `0x990` (`0x44e10990`) | `0x28` (RX Active, Pull Off) | Bit `26` | Salida (`1`) | Entrada (`0`) |
-| **WS / FS** | **P9_29** | `mcasp0_fsx` | `0x994` (`0x44e10994`) | `0x28` (RX Active, Pull Off) | Bit `28` | Salida (`1`) | Entrada (`0`) |
-| **DATA_TX** | **P9_30** | `mcasp0_axr0` | `0x998` (`0x44e10998`) | `0x08` (Output, Pull Off) | Bit `0` | Salida (`1`) | Salida (`1`) |
-| **DATA_RX** | **P9_41** | `mcasp0_axr1` | `0x9a8` (`0x44e109a8`) | `0x28` (RX Active, Pull Off) | Bit `1` | Entrada (`0`) | Entrada (`0`) |
+| Función I2S         | Pin Físico BBB | Señal AM335x    |   Offset Control Module   |      Config Pad (Mode 0)      | Bit en `PFUNC` / `PDIR` | Dirección en Master | Dirección en Slave |
+| :------------------- | :-------------: | :--------------- | :------------------------: | :----------------------------: | :-------------------------: | :------------------: | :-----------------: |
+| **BCLK (CLK)** | **P9_31** | `mcasp0_aclkx` | `0x990` (`0x44e10990`) | `0x28` (RX Active, Pull Off) |         Bit `26`         |    Salida (`1`)    |   Entrada (`0`)   |
+| **WS / FS**    | **P9_29** | `mcasp0_fsx`   | `0x994` (`0x44e10994`) | `0x28` (RX Active, Pull Off) |         Bit `28`         |    Salida (`1`)    |   Entrada (`0`)   |
+| **DATA_TX**    | **P9_30** | `mcasp0_axr0`  | `0x998` (`0x44e10998`) |  `0x08` (Output, Pull Off)  |          Bit `0`          |    Salida (`1`)    |   Salida (`1`)   |
+| **DATA_RX**    | **P9_41** | `mcasp0_axr1`  | `0x9a8` (`0x44e109a8`) | `0x28` (RX Active, Pull Off) |          Bit `1`          |   Entrada (`0`)   |   Entrada (`0`)   |
 
 ### Topologías de conexión
+
 - **Entre dos placas (Master $\leftrightarrow$ Slave)** *(usar resistores serie de 220 $\Omega$ a 330 $\Omega$ para proteger ante colisión de dos Masters)*:
   - `P9_31 (BCLK)` Placa A $\longleftrightarrow$ `P9_31 (BCLK)` Placa B
   - `P9_29 (WS)` Placa A $\longleftrightarrow$ `P9_29 (WS)` Placa B
@@ -126,20 +132,20 @@ dtb_overlay=/boot/dtbs/6.12.100-bone70/device_tree_overlay.dtbo
 
 ### A. Dispositivo de caracteres: `/dev/td3_i2s` (permisos `0666`)
 
-| Operación | Función en `i2s_driver.c` | Comportamiento |
-| :--- | :--- | :--- |
-| **`open()`** | `mymcasp_open` | Apertura exclusiva: retorna `-EBUSY` si el nodo ya está abierto o si sysfs tiene una operación TX/RX en curso. Enciende el reloj e inicializa el periférico y las AFIFOs. |
-| **`release()`** | `mymcasp_close` | Si no está saliendo por señal y quedan datos por transmitir, espera hasta 2 s su vaciado; luego detiene el periférico, vacía las FIFOs de hardware, apaga el reloj y libera la exclusividad. |
-| **`read()`** | `mymcasp_read` | Lectura bloqueante (`TASK_INTERRUPTIBLE`) con exclusión mutua en recepción (`-EBUSY` si está ocupada). Habilita la interrupción de RX y espera hasta reunir `min(len, BUFF_SIZE)` bytes, manteniéndose activa entre lecturas sucesivas hasta `close()`. Retorna bytes leídos o `-ERESTARTSYS` ante señal. |
-| **`write()`** | `mymcasp_write` | Escritura bloqueante (`TASK_INTERRUPTIBLE`) con exclusión mutua en transmisión (`-EBUSY` si está ocupada). Copia los datos del usuario al buffer circular de TX (suspendiéndose si se llena hasta liberar la mitad) y habilita la interrupción de TX para envío continuo por AFIFO. |
+| Operación              | Función en `i2s_driver.c` | Comportamiento                                                                                                                                                                                                                                                                                                             |
+| :---------------------- | :--------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`open()`**    | `mymcasp_open`             | Apertura exclusiva: retorna `-EBUSY` si el nodo ya está abierto o si sysfs tiene una operación TX/RX en curso. Enciende el reloj e inicializa el periférico y las AFIFOs.                                                                                                                                             |
+| **`release()`** | `mymcasp_close`            | Si no está saliendo por señal y quedan datos por transmitir, espera hasta 2 s su vaciado; luego detiene el periférico, vacía las FIFOs de hardware, apaga el reloj y libera la exclusividad.                                                                                                                           |
+| **`read()`**    | `mymcasp_read`             | Lectura bloqueante (`TASK_INTERRUPTIBLE`) con exclusión mutua en recepción (`-EBUSY` si está ocupada). Habilita la interrupción de RX y espera hasta reunir `min(len, BUFF_SIZE)` bytes, manteniéndose activa entre lecturas sucesivas hasta `close()`. Retorna bytes leídos o `-ERESTARTSYS` ante señal. |
+| **`write()`**   | `mymcasp_write`            | Escritura bloqueante (`TASK_INTERRUPTIBLE`) con exclusión mutua en transmisión (`-EBUSY` si está ocupada). Copia los datos del usuario al buffer circular de TX (suspendiéndose si se llena hasta liberar la mitad) y habilita la interrupción de TX para envío continuo por AFIFO.                              |
 
 ### B. Interfaz Sysfs: `/sys/class/td3_i2s/`
 
-| Atributo | Permisos | Función en `i2s_driver.c` | Comportamiento |
-| :--- | :---: | :--- | :--- |
-| **`master`** | `0644` (R/W) | `master_show` / `master_store` | Lee (`0` o `1`) o configura el modo I2S aceptando `"0"`/`"SLAVE"`/`"ESCLAVO"` o `"1"`/`"MASTER"`/`"MAESTRO"` (`-EINVAL` para otros valores). Retorna `-EBUSY` si `/dev/td3_i2s` está abierto o hay TX/RX activas. |
-| **`recibir`** | `0444` (R/O bin) | `recibir_read` | Enciende el hardware bajo demanda, habilita la interrupción de RX, bloquea en `TASK_INTERRUPTIBLE` hasta leer `min(count, BUFF_SIZE)` bytes (offset `0`) y apaga el hardware al finalizar. Retorna `-EBUSY` si `/dev/td3_i2s` u otra lectura están en uso. |
-| **`transmitir`** | `0200` (W/O bin) | `transmitir_write` | Enciende el hardware bajo demanda, encola hasta `min(count, BUFF_SIZE)` bytes, habilita la interrupción de TX, espera en `TASK_INTERRUPTIBLE` hasta vaciar el buffer y apaga el hardware al finalizar. Retorna `-EBUSY` si `/dev/td3_i2s` u otra escritura están en uso. |
+| Atributo                 |      Permisos      | Función en `i2s_driver.c`       | Comportamiento                                                                                                                                                                                                                                                                     |
+| :----------------------- | :----------------: | :--------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`master`**     |   `0644` (R/W)   | `master_show` / `master_store` | Lee (`0` o `1`) o configura el modo I2S aceptando `"0"`/`"SLAVE"`/`"ESCLAVO"` o `"1"`/`"MASTER"`/`"MAESTRO"` (`-EINVAL` para otros valores). Retorna `-EBUSY` si `/dev/td3_i2s` está abierto o hay TX/RX activas.                                           |
+| **`recibir`**    | `0444` (R/O bin) | `recibir_read`                   | Enciende el hardware bajo demanda, habilita la interrupción de RX, bloquea en `TASK_INTERRUPTIBLE` hasta leer `min(count, BUFF_SIZE)` bytes (offset `0`) y apaga el hardware al finalizar. Retorna `-EBUSY` si `/dev/td3_i2s` u otra lectura están en uso.             |
+| **`transmitir`** | `0200` (W/O bin) | `transmitir_write`               | Enciende el hardware bajo demanda, encola hasta `min(count, BUFF_SIZE)` bytes, habilita la interrupción de TX, espera en `TASK_INTERRUPTIBLE` hasta vaciar el buffer y apaga el hardware al finalizar. Retorna `-EBUSY` si `/dev/td3_i2s` u otra escritura están en uso. |
 
 ---
 
@@ -212,7 +218,9 @@ Ejemplos de uso (con `FREQ_TEST = 1000000`, `bitrate_bps = 1000000`):
 ### 4. Ejecución del test de diagnóstico (`loopback`)
 
 #### ¿Cómo funciona y para qué sirve?
+
 El programa [test/loopback.c](file:////wsl.localhost/Ubuntu/home/guido/TDIII/Driver-BBB/test/loopback.c) está pensado para depurar la integridad de la trama recibida usando una sola BeagleBone Black (con `P9_30` conectado a `P9_41`):
+
 1. Cambia el driver a modo `MASTER` vía `/sys/class/td3_i2s/master`.
 2. Ejecuta **Fase 1 (`/dev/td3_i2s`)**: abre el dispositivo con `O_RDWR`, crea un proceso hijo lector y un padre escritor (`fork()`), y valida tramas pseudoaleatorias/etiquetadas de **8 bytes** (trama corta), **30 bytes** (longitud no múltiplo de 4 bytes) y **32 KB** (desborde del buffer circular interno).
 3. Ejecuta **Fase 2 (`/sys/class/td3_i2s/`)**: repite los tres tamaños de prueba usando los atributos binarios `transmitir` y `recibir` en procesos concurrentes.
