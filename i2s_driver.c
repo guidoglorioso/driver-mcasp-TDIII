@@ -687,6 +687,16 @@ static int mymcasp_hw_init(mymcasp_handler_t *handler) {
     mutex_lock(&handler->hw_lock);
 
     if (handler->hw_users == 0) {
+        // Si el interconnect padre (ti-sysc) aún está cerrando su suspend diferido tras probe(), esperar a que libere el clock
+        if (handler->cm_per) {
+            int retries = 50;
+            while (((ioread32(handler->cm_per + CM_PER_MCASP0_CLKCTRL_REG) &
+                     CM_CLKCTRL_MODULEMODE_MASK) != CM_CLKCTRL_MODULEMODE_DISABLE) &&
+                   --retries > 0) {
+                usleep_range(1000, 2000);
+            }
+        }
+
         // Clock Gating directo sobre CM_PER_MCASP0_CLKCTRL
         status = mcasp_clock_enable(handler, true);
         if (status){
@@ -1263,10 +1273,10 @@ static int mymcasp_probe(struct platform_device *pdev)
         goto err_mutex;
     }
 
-    // Configurar Pinmux directamente en el Control Module y dejar el clock apagado en reposo
+    // Configurar Pinmux directamente en el Control Module y registrar el estado de clock de probe
+    // (No apagar CM_PER dentro de probe: al retornar, el bus padre ti-sysc ejecuta sysc_runtime_suspend y lo apaga limpio)
     mcasp_pinmux_init(mymcasp_resource);
     mymcasp_resource->orig_clkctrl = ioread32(mymcasp_resource->cm_per + CM_PER_MCASP0_CLKCTRL_REG);
-    (void)mcasp_clock_enable(mymcasp_resource, false);
 
     // 4. Leer propiedades del Device Tree.
     if (pdev->dev.of_node) {
